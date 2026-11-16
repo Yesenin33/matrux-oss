@@ -1,0 +1,42 @@
+diff -ru a/dlls/ntdll/unix/server.c b/dlls/ntdll/unix/server.c
+--- a/dlls/ntdll/unix/server.c	2026-11-13 09:26:52.309341440 +0000
++++ b/dlls/ntdll/unix/server.c	2026-11-13 09:26:52.324733746 +0000
+@@ -1280,7 +1280,13 @@
+ static const char *init_server_dir( dev_t dev, ino_t ino )
+ {
+     char *dir = NULL;
++    const char *tmp = getenv( "WINESERVER_TMPDIR" );
+ 
++    if (tmp && tmp[0] == '/')
++    {
++        asprintf( &dir, "%s/.wine-%u/server-%llx-%llx", tmp, getuid(), (unsigned long long)dev, (unsigned long long)ino );
++        return dir;
++    }
+ #ifdef __ANDROID__  /* there's no /tmp dir on Android */
+     asprintf( &dir, "%s/.wineserver/server-%llx-%llx", config_dir, (unsigned long long)dev, (unsigned long long)ino );
+ #else
+diff -ru a/server/request.c b/server/request.c
+--- a/server/request.c	2026-11-13 09:26:52.311195679 +0000
++++ b/server/request.c	2026-11-13 09:27:02.670558606 +0000
+@@ -595,7 +595,7 @@
+ /* create the server directory and chdir to it */
+ static char *create_server_dir( int force )
+ {
+-    const char *prefix = getenv( "WINEPREFIX" );
++    const char *prefix = getenv( "WINEPREFIX" ), *tmp;
+     char *p, *config_dir, *base_dir;
+     struct stat st, st2;
+ 
+@@ -639,6 +639,12 @@
+ 
+     /* create the base directory if needed */
+ 
++    if ((tmp = getenv( "WINESERVER_TMPDIR" )) && tmp[0] == '/')
++    {
++        if (asprintf( &base_dir, "%s/.wine-%u", tmp, getuid() ) == -1)
++            fatal_error( "out of memory\n" );
++    }
++    else
+ #ifdef __ANDROID__  /* there's no /tmp dir on Android */
+     if (asprintf( &base_dir, "%s/.wineserver", config_dir ) == -1)
+         fatal_error( "out of memory\n" );

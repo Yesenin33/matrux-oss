@@ -1,0 +1,167 @@
+diff --git a/src/core.c b/src/core.c
+index cd10f07..64a6d14 100644
+--- a/src/core.c
++++ b/src/core.c
+@@ -971,6 +971,8 @@ int initialize(int argc, const char **argv, char** env, x64emu_t** emulator, elf
+         const char* prereserve = getenv("WINEPRELOADRESERVE");
+         printf_log(LOG_INFO, "Wine64 detected, WINEPRELOADRESERVE=\"%s\"\n", prereserve?prereserve:"");
+         if(wine_preloaded || 1) {
++            /* Before any guest instruction. wine_prereserve maps 0x7ffe0000
++             * RW so ntdll's testb [0x7ffe0308] does not hit a PROT_NONE page. */
+             wine_prereserve(prereserve);
+         }
+         // special case for winedbg, doesn't work anyway
+diff --git a/src/include/wine_tools.h b/src/include/wine_tools.h
+index fe44dbe..2403ed4 100644
+--- a/src/include/wine_tools.h
++++ b/src/include/wine_tools.h
+@@ -13,6 +13,9 @@ void* get_wine_prereserve(void);
+  * mapped for Wine (PROT_NONE prereserve). Guest MAP_FIXED_NOREPLACE there
+  * must be retried as MAP_FIXED: that mapping is ours, not a conflict. */
+ int wine_prereserve_owns(uintptr_t addr, size_t size);
++/* 1 if guest MAP_FIXED_NOREPLACE of this range must be retried as MAP_FIXED
++ * and reported as success: our prereserve, or the startup KUSER page. */
++int wine_kuser_noreplace(uintptr_t addr, size_t size);
+ 
+ #ifdef DYNAREC
+ void dynarec_wine_prereserve(void);
+diff --git a/src/tools/wine_tools.c b/src/tools/wine_tools.c
+index 36710ed..a981982 100644
+--- a/src/tools/wine_tools.c
++++ b/src/tools/wine_tools.c
+@@ -80,6 +80,8 @@ void preserve_highest32();
+ #define KUSER_SHARED_DATA ((uintptr_t)0x7ffe0000)
+ #define KUSER_SHARED_SIZE ((size_t)0x1000)
+ 
++static int kuser_ready = 0;
++
+ int wine_prereserve_owns(uintptr_t addr, size_t size)
+ {
+     if(!size || addr + size < addr) return 0;
+@@ -92,6 +94,19 @@ int wine_prereserve_owns(uintptr_t addr, size_t size)
+     return 0;
+ }
+ 
++int wine_kuser_noreplace(uintptr_t addr, size_t size)
++{
++    if(wine_prereserve_owns(addr, size)) return 1;
++    if(!kuser_ready || !size || addr + size < addr) return 0;
++    uintptr_t end = addr + size;
++    if(addr >= KUSER_SHARED_DATA && end <= KUSER_SHARED_DATA + KUSER_SHARED_SIZE)
++        return 1;
++    /* Wine asks for one host page. 16K hosts still start at 0x7ffe0000. */
++    if(addr == KUSER_SHARED_DATA && size <= 0x10000)
++        return 1;
++    return 0;
++}
++
+ #ifdef ANDROID
+ /* Log the VMA covering KUSER_SHARED_DATA. Returns 1 and fills *lo/*hi if mapped. */
+ static int kuser_occupant(uintptr_t *lo, uintptr_t *hi, int *is_stack)
+@@ -157,35 +172,57 @@ static void android_log_kuser_branch(void)
+         (void *)lo, (void *)hi);
+ }
+ 
+-/* If the 48MB block was dropped, still pin the single KUSER page when it is free. */
+-static void android_ensure_kuser_page(void)
++/* ntdll.dll does `testb $1, [0x7ffe0308]` as soon as it runs. The prereserve
++ * left that page PROT_NONE (guest prot 0), so the read is SEGV_ACCERR before
++ * Wine's own NtAllocateVirtualMemory. Punch a real RW page now, and let a
++ * later MAP_FIXED_NOREPLACE of it succeed via wine_kuser_noreplace(). */
++static void android_map_kuser_rw(void)
+ {
+-    if(wine_prereserve_owns(KUSER_SHARED_DATA, KUSER_SHARED_SIZE)) {
+-        printf_log(LOG_INFO, "KUSER branch: page is inside the Wine prereserve; MAP_FIXED_NOREPLACE there is retried as MAP_FIXED\n");
+-        return;
+-    }
+-    if(!isBlockFree((void *)KUSER_SHARED_DATA, KUSER_SHARED_SIZE)) {
+-        printf_log(LOG_INFO, "KUSER branch: page still occupied after prereserve; MAP_FIXED_NOREPLACE will return c0000018\n");
+-        return;
+-    }
+-    int idx = 0;
+-    while(my_wine_reserve[idx].size) ++idx;
+-    if(idx >= (int)(sizeof(my_wine_reserve) / sizeof(my_wine_reserve[0])) - 1) {
+-        printf_log(LOG_INFO, "KUSER: prereserve table full, cannot add 0x7ffe0000\n");
+-        return;
++    FILE *f = fopen("/proc/self/maps", "r");
++    if(f) {
++        char line[512];
++        while(fgets(line, sizeof(line), f)) {
++            uintptr_t s, e;
++            if(sscanf(line, "%lx-%lx", &s, &e) != 2) continue;
++            if(KUSER_SHARED_DATA < s || KUSER_SHARED_DATA >= e) continue;
++            if(strstr(line, "[stack]")) {
++                fclose(f);
++                printf_log(LOG_INFO, "KUSER branch: startup RW map skipped, 0x7ffe0000 is [stack]\n");
++                return;
++            }
++            break;
++        }
++        fclose(f);
+     }
+-    void *ret = mmap((void *)KUSER_SHARED_DATA, KUSER_SHARED_SIZE, 0,
+-        MAP_FIXED | MAP_PRIVATE | MAP_ANON | MAP_NORESERVE, -1, 0);
++    void *ret = mmap((void *)KUSER_SHARED_DATA, KUSER_SHARED_SIZE,
++        PROT_READ | PROT_WRITE, MAP_FIXED | MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+     if(ret != (void *)KUSER_SHARED_DATA) {
+-        printf_log(LOG_INFO, "KUSER: mmap(0x7ffe0000) failed: %s\n", strerror(errno));
++        printf_log(LOG_INFO, "KUSER branch: startup RW mmap(0x7ffe0000) failed: %s\n", strerror(errno));
+         if(ret && ret != MAP_FAILED) munmap(ret, KUSER_SHARED_SIZE);
+         return;
+     }
+-    my_wine_reserve[idx].addr = (void *)KUSER_SHARED_DATA;
+-    my_wine_reserve[idx].size = KUSER_SHARED_SIZE;
+-    setProtection_mmap(KUSER_SHARED_DATA, KUSER_SHARED_SIZE, 0);
+-    printf_log(LOG_INFO, "WINE prereserve of %p:0x%lx done\n",
+-        my_wine_reserve[idx].addr, my_wine_reserve[idx].size);
++    if(!wine_prereserve_owns(KUSER_SHARED_DATA, KUSER_SHARED_SIZE)) {
++        int idx = 0;
++        while(my_wine_reserve[idx].size) ++idx;
++        if(idx < (int)(sizeof(my_wine_reserve) / sizeof(my_wine_reserve[0])) - 1) {
++            my_wine_reserve[idx].addr = (void *)KUSER_SHARED_DATA;
++            my_wine_reserve[idx].size = KUSER_SHARED_SIZE;
++        } else {
++            printf_log(LOG_INFO, "KUSER branch: prereserve table full, page is mapped but not tracked\n");
++        }
++    }
++    setProtection_mmap(KUSER_SHARED_DATA, KUSER_SHARED_SIZE, PROT_READ | PROT_WRITE);
++    /* Same bit Wine writes into KUSER_SHARED_DATA.SystemCall. Harmless if a
++     * later MAP_FIXED shared section replaces the page. */
++    ((volatile uint8_t *)KUSER_SHARED_DATA)[0x308] = 1;
++    kuser_ready = 1;
++    printf_log(LOG_INFO, "KUSER branch: startup RW page at 0x7ffe0000 before guest runs\n");
++}
++
++/* If the 48MB block was dropped, still pin the single KUSER page when it is free. */
++static void android_ensure_kuser_page(void)
++{
++    android_map_kuser_rw();
+ }
+ #endif
+ 
+diff --git a/src/wrapped/wrappedlibc.c b/src/wrapped/wrappedlibc.c
+index 66a967a..14026a3 100644
+--- a/src/wrapped/wrappedlibc.c
++++ b/src/wrapped/wrappedlibc.c
+@@ -4150,12 +4150,19 @@ EXPORT void* my_mmap64(x64emu_t* emu, void *addr, size_t length, int prot, int f
+         if(ret==MAP_FAILED && addr && length && box64_wine
+            && (flags & MAP_FIXED_NOREPLACE) && !(flags & MAP_FIXED)
+            && (e==EEXIST || e==EINVAL)
+-           && wine_prereserve_owns((uintptr_t)addr, length)) {
++           && wine_kuser_noreplace((uintptr_t)addr, length)) {
+             int fixed = (flags | MAP_FIXED) & ~MAP_FIXED_NOREPLACE;
+             ret = box_mmap(addr, length, prot, fixed, fd, offset);
+             e = errno;
+             if(ret!=MAP_FAILED)
+-                printf_log(LOG_INFO, "Android: mmap(%p, 0x%zx) MAP_FIXED_NOREPLACE -> MAP_FIXED inside Wine prereserve\n", addr, length);
++                printf_log(LOG_INFO, "KUSER branch: mmap(%p, 0x%zx) MAP_FIXED_NOREPLACE -> MAP_FIXED success\n", addr, length);
++            else if((uintptr_t)addr == 0x7ffe0000 && length <= 0x10000) {
++                /* Startup already published this page. Wine must see success,
++                 * not c0000018, even if the kernel refuses to replace it. */
++                ret = addr;
++                e = 0;
++                printf_log(LOG_INFO, "KUSER branch: mmap(%p, 0x%zx) MAP_FIXED_NOREPLACE kept existing page (success)\n", addr, length);
++            }
+         }
+ #endif
+     }

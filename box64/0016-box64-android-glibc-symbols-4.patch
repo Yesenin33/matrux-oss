@@ -1,0 +1,714 @@
+diff --git a/src/wrapped/wrappedlibc.c b/src/wrapped/wrappedlibc.c
+--- a/src/wrapped/wrappedlibc.c
++++ b/src/wrapped/wrappedlibc.c
+@@ -4226,6 +4226,240 @@
+ }
+ #endif
+ 
++#ifdef ANDROID
++// ---------------------------------------------------------------------------
++// 0016: the remaining glibc ABI that bionic neither exports nor has under the
++// __-name, imported by our x86_64 guests. A full `nm -uD` scan of every
++// x86_64 .so shipped in the runtime (see build-android-deps.sh, patch 0016)
++// showed that box64 already listed most of these as GO/GOW (-> dlsym into the
++// native libc); on bionic the dlsym yields NULL, so a guest's *global* PLT
++// import failed hard with
++//   "Symbol X not found, cannot apply R_X86_64_JUMP_SLOT".
++// The symbol that actually blocked libgnutls.so.30 was dcgettext; the rest are
++// the same class (libintl and the glibc string/malloc/fortify entry points)
++// found by the same scan.
++// gettext()/dgettext() were handled in 0013; this adds dcgettext and the rest
++// of the libintl family plus the other missing glibc entry points.
++// ---------------------------------------------------------------------------
++#include <fcntl.h>
++#include <errno.h>
++#include <sys/select.h>
++#include <sys/poll.h>
++#include <unistd.h>
++#include <sys/syscall.h>
++
++// ---- libintl: bionic has no libintl (and no NLS); the untranslated message is
++//      the correct answer when there is no catalogue.
++EXPORT char* my_dcgettext(x64emu_t* emu, const char* domainname, const char* msgid, int category)
++{
++    (void)emu; (void)domainname; (void)category;
++    return (char*)msgid;
++}
++EXPORT char* my___dcgettext(x64emu_t* emu, const char* domainname, const char* msgid, int category)
++{
++    (void)emu; (void)domainname; (void)category;
++    return (char*)msgid;
++}
++EXPORT char* my_ngettext(x64emu_t* emu, const char* msgid, const char* msgid_plural, unsigned long n)
++{
++    (void)emu;
++    return (char*)((n == 1) ? msgid : msgid_plural);
++}
++EXPORT char* my_dngettext(x64emu_t* emu, const char* domainname, const char* msgid, const char* msgid_plural, unsigned long n)
++{
++    (void)emu; (void)domainname;
++    return (char*)((n == 1) ? msgid : msgid_plural);
++}
++EXPORT char* my_dcngettext(x64emu_t* emu, const char* domainname, const char* msgid, const char* msgid_plural, unsigned long n, int category)
++{
++    (void)emu; (void)domainname; (void)category;
++    return (char*)((n == 1) ? msgid : msgid_plural);
++}
++EXPORT char* my_textdomain(x64emu_t* emu, const char* domainname)
++{
++    (void)emu;
++    // queries (NULL) return the current domain, which is "messages" by default
++    return (char*)(domainname ? domainname : "messages");
++}
++
++// ---- numeric parsing: bionic has the <fn>_l spelling, not glibc's __<fn>_l ----
++EXPORT long my___strtol_l(x64emu_t* emu, const char* nptr, char** endptr, int base, locale_t loc)
++{
++    (void)emu;
++    return strtol_l(nptr, endptr, base, loc);
++}
++EXPORT unsigned long my___strtoul_l(x64emu_t* emu, const char* nptr, char** endptr, int base, locale_t loc)
++{
++    (void)emu;
++    return strtoul_l(nptr, endptr, base, loc);
++}
++EXPORT long long my___strtoll_l(x64emu_t* emu, const char* nptr, char** endptr, int base, locale_t loc)
++{
++    (void)emu;
++    return strtoll_l(nptr, endptr, base, loc);
++}
++EXPORT unsigned long long my___strtoull_l(x64emu_t* emu, const char* nptr, char** endptr, int base, locale_t loc)
++{
++    (void)emu;
++    return strtoull_l(nptr, endptr, base, loc);
++}
++EXPORT long double my___strtold_l(x64emu_t* emu, const char* nptr, char** endptr, locale_t loc)
++{
++    (void)emu;
++    return strtold_l(nptr, endptr, loc);
++}
++
++// ---- string helpers glibc has and bionic does not ----
++EXPORT void* my_rawmemchr(x64emu_t* emu, const void* s, int c)
++{
++    (void)emu;
++    const unsigned char ch = (unsigned char)c;
++    const unsigned char* p = (const unsigned char*)s;
++    while (*p != ch) ++p;
++    return (void*)p;
++}
++EXPORT void* my___rawmemchr(x64emu_t* emu, const void* s, int c)
++{
++    (void)emu;
++    return my_rawmemchr(emu, s, c);
++}
++EXPORT char* my___stpcpy(x64emu_t* emu, char* dest, const char* src)
++{
++    (void)emu;
++    return stpcpy(dest, src);
++}
++EXPORT char* my___strtok_r(x64emu_t* emu, char* s, const char* delim, char** saveptr)
++{
++    (void)emu;
++    return strtok_r(s, delim, saveptr);
++}
++EXPORT char* my___strdup(x64emu_t* emu, const char* s)
++{
++    (void)emu;
++    return strdup(s);
++}
++EXPORT int my___strcasecmp(x64emu_t* emu, const char* a, const char* b)
++{
++    (void)emu;
++    return strcasecmp(a, b);
++}
++EXPORT char* my___strcasestr(x64emu_t* emu, const char* haystack, const char* needle)
++{
++    (void)emu;
++    return strcasestr(haystack, needle);
++}
++
++// ---- fortified variants: run the base function, skipping the guest-side check ----
++EXPORT unsigned long my___fdelt_chk(x64emu_t* emu, long fd)
++{
++    (void)emu;
++    if (fd < 0 || fd >= FD_SETSIZE)
++        return 0;
++    return (unsigned long)fd / (8 * sizeof(long));   // __NFDBITS == 8*sizeof(long)
++}
++EXPORT wchar_t* my___wcsncpy_chk(x64emu_t* emu, wchar_t* dest, const wchar_t* src, size_t n, size_t dstlen)
++{
++    (void)emu; (void)dstlen;
++    return wcsncpy(dest, src, n);
++}
++EXPORT size_t my___mbstowcs_chk(x64emu_t* emu, wchar_t* dst, const char* src, size_t n, size_t dstlen)
++{
++    (void)emu; (void)dstlen;
++    return mbstowcs(dst, src, n);
++}
++
++// ---- filesystem / misc glibc entry points ----
++EXPORT int my___open64_2(x64emu_t* emu, const char* path, int flags, int mode)
++{
++    (void)emu; (void)mode;      // glibc's __open64_2 has no mode argument
++    return open(path, flags);
++}
++EXPORT int my___openat64_2(x64emu_t* emu, int dirfd, const char* path, int flags, int mode)
++{
++    (void)emu; (void)mode;      // glibc's __openat64_2 has no mode argument
++    return openat(dirfd, path, flags);
++}
++EXPORT void* my___xpg_strerror_r(x64emu_t* emu, int errnum, char* buf, size_t buflen)
++{
++    (void)emu;
++    // glibc's __xpg_strerror_r is the XSI-compliant int strerror_r; forward it
++    return (void*)(intptr_t)strerror_r(errnum, buf, buflen);
++}
++EXPORT void* my___gmtime_r(x64emu_t* emu, const void* timep, void* result)
++{
++    (void)emu;
++    return gmtime_r((const time_t*)timep, (struct tm*)result);
++}
++EXPORT char* my_secure_getenv(x64emu_t* emu, const char* name)
++{
++    (void)emu;
++    // bionic has no secure_getenv; without AT_SECURE the result is the same
++    return getenv(name);
++}
++EXPORT char* my_index(x64emu_t* emu, const char* s, int c)
++{
++    (void)emu;
++    return strchr(s, c);        // deprecated glibc alias
++}
++EXPORT char* my_rindex(x64emu_t* emu, const char* s, int c)
++{
++    (void)emu;
++    return strrchr(s, c);       // deprecated glibc alias
++}
++EXPORT int my_close_range(x64emu_t* emu, unsigned int first, unsigned int last, int flags)
++{
++    (void)emu;
++#ifdef SYS_close_range
++    return syscall(SYS_close_range, first, last, (unsigned)flags);
++#else
++    if (flags) { errno = EINVAL; return -1; }
++    for (unsigned i = first; i <= last && i < 1024; ++i)
++        close((int)i);
++    return 0;
++#endif
++}
++EXPORT int my___poll(x64emu_t* emu, void* fds, unsigned long nfds, int timeout)
++{
++    (void)emu;
++    return poll((struct pollfd*)fds, (nfds_t)nfds, timeout);
++}
++EXPORT void* my___sbrk(x64emu_t* emu, long increment)
++{
++    (void)emu; (void)increment;
++    // bionic has no sbrk(); a real program never needs it under box64
++    errno = ENOMEM;
++    return (void*)-1;
++}
++EXPORT int my_getspnam_r(x64emu_t* emu, const char* name, void* spbuf, char* buf, size_t buflen, void* result)
++{
++    (void)emu; (void)name; (void)spbuf; (void)buf; (void)buflen; (void)result;
++    errno = ENOSYS;             // no shadow database on Android
++    return -1;
++}
++
++// ---- glibc internal malloc entry points (referenced by libc_malloc_debug.so) ----
++EXPORT void* my___libc_malloc(x64emu_t* emu, size_t size)
++{
++    (void)emu;
++    return malloc(size);
++}
++EXPORT void my___libc_free(x64emu_t* emu, void* p)
++{
++    (void)emu;
++    free(p);
++}
++EXPORT void* my___libc_realloc(x64emu_t* emu, void* p, size_t size)
++{
++    (void)emu;
++    return realloc(p, size);
++}
++EXPORT void* my___libc_memalign(x64emu_t* emu, size_t align, size_t size)
++{
++    (void)emu;
++    return memalign(align, size);
++}
++#endif
++
+ EXPORT void* my_realpath(x64emu_t* emu, void* path, void* resolved_path)
+ {
+     if(path && isProcSelf(path, "exe")) {
+diff --git a/src/wrapped/wrappedlibc_private.h b/src/wrapped/wrappedlibc_private.h
+--- a/src/wrapped/wrappedlibc_private.h
++++ b/src/wrapped/wrappedlibc_private.h
+@@ -190,7 +190,12 @@
+ GOW(closedir, iFp)
+ GO(closelog, vFv)
+ //GO(__close_nocancel, 
++#ifdef ANDROID
++// 0016: bionic has no close_range; my_ implementation
++GOM(close_range, iFEuui)
++#else
+ GO(close_range, iFuui)
++#endif
+ GO(__cmsg_nxthdr, pFpp)
+ #ifdef STATICBUILD
+ //GOM(cnd_broadcast,
+@@ -262,9 +267,24 @@
+ GO(daemon, iFii)
+ DATAB(__daylight, 4)
+ DATA(daylight, 4)
++#ifdef ANDROID
++// 0016: bionic has no __dcgettext; my_ implementation
++GOM(__dcgettext, pFEppi)
++#else
+ GO(__dcgettext, pFppi)
++#endif
++#ifdef ANDROID
++// 0016: bionic has no dcgettext; my_ implementation
++GOM(dcgettext, pFEppi)
++#else
+ GOW(dcgettext, pFppi)
++#endif
++#ifdef ANDROID
++// 0016: bionic has no dcngettext; my_ implementation
++GOM(dcngettext, pFEpppLi)
++#else
+ GOW(dcngettext, pFpppLi)
++#endif
+ //GO(__default_morecore, 
+ #ifdef STATICBUILD
+ //GO(delete_module, 
+@@ -300,7 +320,12 @@
+ //GO(_dl_signal_exception, 
+ //GO(_dl_sym, 
+ //GO(_dl_vsym, 
++#ifdef ANDROID
++// 0016: bionic has no dngettext; my_ implementation
++GOM(dngettext, pFEpppL)
++#else
+ GOW(dngettext, pFpppL)
++#endif
+ GOW(dn_skipname, iFpp)
+ GOM(dprintf, iFEipV)
+ GOM(__dprintf_chk, iFEiipV)
+@@ -454,7 +479,12 @@
+ GO(fcvt, pFdipp)
+ GO(fcvt_r, iFdipppL)
+ GO(fdatasync, iFi)
++#ifdef ANDROID
++// 0016: bionic has no __fdelt_chk; my_ implementation
++GOM(__fdelt_chk, LFEL)
++#else
+ GO(__fdelt_chk, LFL)
++#endif
+ //GO(__fdelt_warn, 
+ //GO(fdetach, 
+ GO(fdopen, SFip)
+@@ -829,7 +859,12 @@
+ GO(getspent, pFv)
+ GO(getspent_r, iFppLp)
+ GO(getspnam, pFp)
++#ifdef ANDROID
++// 0016: bionic has no getspnam_r; my_ implementation
++GOM(getspnam_r, iFEpppLp)
++#else
+ GO(getspnam_r, iFpppLp)
++#endif
+ GO(getsubopt, iFppp)
+ #ifdef ANDROID
+ // bionic has no gettext; stub returns msgid
+@@ -873,7 +908,12 @@
+ GOW(globfree64, vFp)
+ GOW(glob_pattern_p, iFpi)
+ GO(gmtime, pFp)
++#ifdef ANDROID
++// 0016: bionic has no __gmtime_r; my_ implementation
++GOM(__gmtime_r, pFEpp)
++#else
+ GO(__gmtime_r, pFpp)
++#endif
+ GOW(gmtime_r, pFpp)
+ GOW(gnu_dev_major, uFU)
+ GOW(gnu_dev_makedev, UFuu)
+@@ -920,7 +960,12 @@
+ GOW(imaxdiv, HFII)
+ DATAV(in6addr_any, 16)
+ DATAV(in6addr_loopback, 16)
++#ifdef ANDROID
++// 0016: bionic has no index; my_ implementation
++GOM(index, pFEpi)
++#else
+ GO(index, pFpi)
++#endif
+ GO(inet6_opt_append, iFpuiCuCp)
+ GO(inet6_opt_find, iFpuiCpp)
+ GO(inet6_opt_finish, iFpui)
+@@ -1310,15 +1355,30 @@
+ //GO(__libc_fatal, 
+ //GO(__libc_fcntl64, 
+ //GO(__libc_fork, 
++#ifdef ANDROID
++// 0016: bionic has no __libc_free; my_ implementation
++GOM(__libc_free, vFEp)
++#else
+ GO(__libc_free, vFp)
++#endif
+ //GO(__libc_freeres, 
+ //GO(__libc_ifunc_impl_list, 
+ //GO(__libc_init_first, 
+ //GO(__libc_longjmp, 
+ //GO(__libc_mallinfo, 
++#ifdef ANDROID
++// 0016: bionic has no __libc_malloc; my_ implementation
++GOM(__libc_malloc, pFEL)
++#else
+ GO(__libc_malloc, pFL)
++#endif
+ //GO(__libc_mallopt, 
++#ifdef ANDROID
++// 0016: bionic has no __libc_memalign; my_ implementation
++GOM(__libc_memalign, pFELL)
++#else
+ GO(__libc_memalign, pFLL)
++#endif
+ //GO(__libc_msgrcv, 
+ //GO(__libc_msgsnd, 
+ //GO(__libc_pread, 
+@@ -1326,7 +1386,12 @@
+ GO(__libc_pvalloc, pFL)
+ //GO(__libc_pwrite, 
+ //GO(__libc_readline_unlocked, 
++#ifdef ANDROID
++// 0016: bionic has no __libc_realloc; my_ implementation
++GOM(__libc_realloc, pFEpL)
++#else
+ GO(__libc_realloc, pFpL)
++#endif
+ //GO(__libc_reallocarray, 
+ //GO(__libc_rpc_getport, 
+ //GO(__libc_sa_len, 
+@@ -1410,7 +1475,12 @@
+ GO(__mbsrtowcs_chk, LFppLpL)
+ #endif
+ GO(mbstowcs, LFppL)
++#ifdef ANDROID
++// 0016: bionic has no __mbstowcs_chk; my_ implementation
++GOM(__mbstowcs_chk, LFEppLL)
++#else
+ GO(__mbstowcs_chk, LFppLL)
++#endif
+ GO(mbtowc, iFppL)
+ //GOM(mcheck, iFp)
+ GO(mcheck_check_all, vFv)
+@@ -1542,7 +1612,12 @@
+ //GO(nfsservctl, 
+ GOM(nftw, iFEppii)
+ GOM(nftw64, iFEppii)
++#ifdef ANDROID
++// 0016: bionic has no ngettext; my_ implementation
++GOM(ngettext, pFEppL)
++#else
+ GOW(ngettext, pFppL)
++#endif
+ GO(nice, iFi)
+ //DATAB(_nl_domain_bindings, 
+ #ifdef ANDROID
+@@ -1606,12 +1681,22 @@
+ GO(__open_2, iFpO)
+ //GOW(__open64, 
+ GOWM(open64, iFEpON)
++#ifdef ANDROID
++// 0016: bionic has no __open64_2; my_ implementation
++GOM(__open64_2, iFEpO)
++#else
+ GO(__open64_2, iFpO)
++#endif
+ //GO(__open64_nocancel, 
+ GOW(openat, iFipON)
+ GO(__openat_2, iFipO)
+ GOW(openat64, iFipON)
++#ifdef ANDROID
++// 0016: bionic has no __openat64_2; my_ implementation
++GOM(__openat64_2, iFEipO)
++#else
+ GO(__openat64_2, iFipO)
++#endif
+ GO(open_by_handle_at, iFipi)
+ GOW(open_tree, iFipu)
+ //GO(__open_catalog, 
+@@ -1662,7 +1747,12 @@
+ GO(pmap_set, iFLLii)
+ GO(pmap_unset, iFLL)
+ #endif
++#ifdef ANDROID
++// 0016: bionic has no __poll; my_ implementation
++GOM(__poll, iFEpLi)
++#else
+ GO(__poll, iFpLi)
++#endif
+ GO(poll, iFpLi)
+ GO(__poll_chk, iFpuiL)
+ GO(popen, SFpp)
+@@ -1788,8 +1878,18 @@
+ GOW(random, lFv)
+ GOW(random_r, iFpp)
+ GO(rand_r, iFp)
++#ifdef ANDROID
++// 0016: bionic has no __rawmemchr; my_ implementation
++GOM(__rawmemchr, pFEpi)
++#else
+ GO(__rawmemchr, pFpi)
++#endif
++#ifdef ANDROID
++// 0016: bionic has no rawmemchr; my_ implementation
++GOM(rawmemchr, pFEpi)
++#else
+ GO(rawmemchr, pFpi)
++#endif
+ GO(rcmd, iFpWpppp)
+ GO(rcmd_af, iFpWppppW)
+ //DATAB(__rcmd_errstr, 
+@@ -1880,7 +1980,12 @@
+ GO(rexec, iFpipppp)
+ GO(rexec_af, iFpippppW)
+ //DATAB(rexecoptions, 
++#ifdef ANDROID
++// 0016: bionic has no rindex; my_ implementation
++GOM(rindex, pFEpi)
++#else
+ GO(rindex, pFpi)
++#endif
+ GOW(rmdir, iFp)
+ #ifdef STATICBUILD
+ //DATAB(rpc_createerr, 
+@@ -1908,7 +2013,12 @@
+ GO(ruserok, iFpipp)
+ GO(ruserok_af, iFpippW)
+ //GO(ruserpass, 
++#ifdef ANDROID
++// 0016: bionic has no __sbrk; my_ implementation
++GOM(__sbrk, pFEl)
++#else
+ GO(__sbrk, pFl)
++#endif
+ GO(sbrk, pFl)
+ GOWM(scandir, iFEpppp)
+ GOWM(scandir64, iFEpppp)
+@@ -1936,7 +2046,12 @@
+ GO(__sched_yield, iFv)
+ GOW(sched_yield, iFv)
+ GO2(__secure_getenv, pFp, getenv)   // not always present
++#ifdef ANDROID
++// 0016: bionic has no secure_getenv; my_ implementation
++GOM(secure_getenv, pFEp)
++#else
+ GOW(secure_getenv, pFp)
++#endif
+ GO(seed48, pFp)
+ GOW(seed48_r, iFpp)
+ GO(seekdir, vFpl)
+@@ -2119,18 +2234,33 @@
+ DATA(stdout, 8)
+ //GOW(step, 
+ GOM(stime, iFEp)
++#ifdef ANDROID
++// 0016: bionic has no __stpcpy; my_ implementation
++GOM(__stpcpy, pFEpp)
++#else
+ GO(__stpcpy, pFpp)
++#endif
+ GO(stpcpy, pFpp)
+ GO(__stpcpy_chk, pFppL)
+ //GO(__stpcpy_small, 
+ GO(__stpncpy, pFppL)
+ GO(stpncpy, pFppL)
+ GO(__stpncpy_chk, pFppLL)
++#ifdef ANDROID
++// 0016: bionic has no __strcasecmp; my_ implementation
++GOM(__strcasecmp, iFEpp)
++#else
+ GO(__strcasecmp, iFpp)
++#endif
+ GO(strcasecmp, iFpp)
+ //GO(__strcasecmp_l, 
+ GO(strcasecmp_l, iFppp)
++#ifdef ANDROID
++// 0016: bionic has no __strcasestr; my_ implementation
++GOM(__strcasestr, pFEpp)
++#else
+ GO(__strcasestr, pFpp)
++#endif
+ GOW(strcasestr, pFpp)
+ GO(strcat, pFpp)
+ GO(__strcat_chk, pFppL)
+@@ -2152,7 +2282,12 @@
+ //GO(__strcspn_c1, 
+ //GO(__strcspn_c2, 
+ //GO(__strcspn_c3, 
++#ifdef ANDROID
++// 0016: bionic has no __strdup; my_ implementation
++GOM(__strdup, pFEp)
++#else
+ GO(__strdup, pFp)
++#endif
+ GOW(strdup, pFp)
+ GO(strerror, pFi)
+ GOW(strerrorname_np, pFi)
+@@ -2266,7 +2401,12 @@
+ GO2(__isoc23_wcstoul, LFppi, wcstoul)
+ GO2(__isoc23_wcstoull, UFppi, wcstoull)
+ GO(strtok, pFpp)
++#ifdef ANDROID
++// 0016: bionic has no __strtok_r; my_ implementation
++GOM(__strtok_r, pFEppp)
++#else
+ GO(__strtok_r, pFppp)
++#endif
+ GOW(strtok_r, pFppp)
+ //GO(__strtok_r_1c, 
+ GO(strtol, lFppi)
+@@ -2276,20 +2416,40 @@
+ GOWD(strtold_l, DFppp, strtod_l)
+ //GO(__strtold_nan, 
+ GO(__strtol_internal, lFppii)
++#ifdef ANDROID
++// 0016: bionic has no __strtol_l; my_ implementation
++GOM(__strtol_l, lFEppip)
++#else
+ GO(__strtol_l, lFppip)
++#endif
+ GO(strtol_l, lFppip)
+ GOW(strtoll, IFppi)
+ GO(__strtoll_internal, IFppii)
++#ifdef ANDROID
++// 0016: bionic has no __strtoll_l; my_ implementation
++GOM(__strtoll_l, IFEppip)
++#else
+ GOW(__strtoll_l, IFppip)
++#endif
+ GOW(strtoll_l, IFppip)
+ GOW(strtoq, IFppi)
+ GO(strtoul, LFppi)
+ GO(__strtoul_internal, LFppii)
++#ifdef ANDROID
++// 0016: bionic has strtoul_l(); glibc's __strtoul_l is missing
++GOM(__strtoul_l, LFEppip)
++#else
+ //GO(__strtoul_l, 
++#endif
+ GO(strtoul_l, LFppip)
+ GOW(strtoull, UFppi)
+ GO(__strtoull_internal, UFppii)
++#ifdef ANDROID
++// 0016: bionic has no __strtoull_l; my_ implementation
++GOM(__strtoull_l, UFEppip)
++#else
+ GOW(__strtoull_l, UFppip)
++#endif
+ GOW(strtoull_l, UFppip)
+ GO(strtoumax, UFppi)
+ GO2(__isoc23_strtoumax, UFppi, strtoumax)
+@@ -2424,7 +2584,12 @@
+ GO(tee, lFiiLu)
+ GO(telldir, lFp)
+ GO(tempnam, pFpp)
++#ifdef ANDROID
++// 0016: bionic has no textdomain; my_ implementation
++GOM(textdomain, pFEp)
++#else
+ GOW(textdomain, pFp)
++#endif
+ //GO(__tfind, 
+ GOWM(tfind, pFEppp)
+ GOW(tgkill, iFiii)
+@@ -2656,7 +2821,12 @@
+ GO(__wcsncat_chk, pFppLL)
+ GO(wcsncmp, iFppL)
+ GOW(wcsncpy, pFppL)
++#ifdef ANDROID
++// 0016: bionic has no __wcsncpy_chk; my_ implementation
++GOM(__wcsncpy_chk, pFEppLL)
++#else
+ GO(__wcsncpy_chk, pFppLL)
++#endif
+ GO(wcsnlen, LFpL)
+ GO(wcsnrtombs, LFppLLp)
+ #ifdef STATICBUILD
+@@ -2935,7 +3105,12 @@
+ GO(__xpg_basename, pFp)
+ #endif
+ GOW(__xpg_sigpause, iFi)
++#ifdef ANDROID
++// 0016: bionic has no __xpg_strerror_r; my_ implementation
++GOM(__xpg_strerror_r, pFEipL)
++#else
+ GO(__xpg_strerror_r, pFipL)
++#endif
+ //GOM(xprt_register, vFp)
+ //GOM(xprt_unregister, vFp)
+ GOM(__xstat, iFEipp)
+diff --git a/src/wrapped/wrappedlibpthread.c b/src/wrapped/wrappedlibpthread.c
+--- a/src/wrapped/wrappedlibpthread.c
++++ b/src/wrapped/wrappedlibpthread.c
+@@ -56,6 +56,27 @@
+ }
+ EXPORT int32_t my___pthread_atfork(x64emu_t *emu, void* prepare, void* parent, void* child) __attribute__((alias("my_pthread_atfork")));
+ 
++#ifdef ANDROID
++// 0016: bionic exports neither pthread_cancel nor pthread_setcanceltype (its
++// pthread implementation is a stripped subset of the POSIX one). Guests that
++// import them (libpipewire, libgpg-error, libSDL3, ...) must not fail their
++// global JUMP_SLOT relocation. Cancellation is impossible to emulate faithfully
++// here, so report success without cancelling; setting the cancellation type is
++// recorded as a no-op so the guest sees the requested state.
++EXPORT int32_t my_pthread_cancel(x64emu_t* emu, uintptr_t thread)
++{
++    (void)emu; (void)thread;
++    return 0;
++}
++EXPORT int32_t my_pthread_setcanceltype(x64emu_t* emu, int type, int* oldtype)
++{
++    (void)emu;
++    if (oldtype)
++        *oldtype = type;    // pretend the previous type was the same
++    return 0;
++}
++#endif
++
+ EXPORT void my___pthread_initialize()
+ {
+     // nothing, the lib initialize itself now
+diff --git a/src/wrapped/wrappedlibpthread_private.h b/src/wrapped/wrappedlibpthread_private.h
+--- a/src/wrapped/wrappedlibpthread_private.h
++++ b/src/wrapped/wrappedlibpthread_private.h
+@@ -88,7 +88,12 @@
+ GOM(pthread_barrier_init, iFEppu)
+ #endif
+ GO(pthread_barrier_wait, iFp)
++#ifdef ANDROID
++// 0016: bionic has no pthread_cancel; my_ implementation
++GOM(pthread_cancel, iFEL)
++#else
+ GO(pthread_cancel, iFL)
++#endif
+ GO(pthread_clockjoin_np, iFppip)
+ GOM(_pthread_cleanup_pop, vFEpi)
+ GOM(_pthread_cleanup_pop_restore, vFEpi)
+@@ -252,7 +257,12 @@
+ GO2(pthread_setaffinity_np@GLIBC_2.3.3, iFEpp, my_pthread_setaffinity_np_old)
+ GOM(pthread_setaffinity_np, iFEpLp)
+ GO(pthread_setcancelstate, iFip)
++#ifdef ANDROID
++// 0016: bionic has no pthread_setcanceltype; my_ implementation
++GOM(pthread_setcanceltype, iFEip)
++#else
+ GO(pthread_setcanceltype, iFip)
++#endif
+ GO(pthread_setconcurrency, iFi)
+ GO(pthread_setname_np, iFpp)
+ GO(pthread_setschedparam, iFLip)

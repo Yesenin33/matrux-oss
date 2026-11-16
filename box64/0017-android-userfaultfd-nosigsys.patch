@@ -1,0 +1,55 @@
+--- a/src/emu/x64syscall.c
++++ b/src/emu/x64syscall.c
+@@ -536,6 +536,11 @@
+ 
+ void EXPORT x64Syscall(x64emu_t *emu)
+ {
++    // userfaultfd (0x143) has no Wine-NT counterpart (NT syscall numbers stop at
++    // 0xf9), so never route it through the SIGSYS PE<->unix bridge: perform the
++    // real syscall and hand the guest a plain errno (ENOSYS) instead of a signal.
++    if(R_EAX == 323)
++        return x64Syscall_linux(emu);
+     // check if it's a wine process, then filter the syscall (simulate SECCMP)
+     // Wine uses SUD (syscall user dispatch) since 11.5, bypass this hack if SUD is effective
+     if(box64_wine && !box64_is32bits && (!emu || !emu->sud_enabled)) {
+@@ -1061,6 +1066,18 @@
+         case 317:   // sys_seccomp
+             R_RAX = 0;  // ignoring call
+             break;
++        case 323:   // sys_userfaultfd
++            #ifdef __NR_userfaultfd
++            // Try the real syscall. Android seccomp/SELinux usually blocks it
++            // with EPERM (or the kernel lacks it -> ENOSYS); report ENOSYS to the
++            // guest and keep running instead of falling into the SIGSYS loop.
++            S_RAX = syscall(__NR_userfaultfd, R_RDI);
++            if(S_EAX==-1)
++                S_RAX = (errno==EPERM || errno==ENOSYS) ? -ENOSYS : -errno;
++            #else
++            S_RAX = -ENOSYS;
++            #endif
++            break;
+         case 334: // It is helpeful to run static binary
+             R_RAX = -ENOSYS;
+             break;
+@@ -1458,6 +1475,21 @@
+             #else
+             errno = ENOSYS;
+             return -1;
++            #endif
++        case 323:   // sys_userfaultfd
++            #ifdef __NR_userfaultfd
++            {
++                // Same as the raw-syscall path: make the real call, but map a
++                // seccomp/SELinux EPERM (or unsupported ENOSYS) to ENOSYS so the
++                // guest's libc sees a clean -1/ENOSYS and no SIGSYS is raised.
++                long ret = syscall(__NR_userfaultfd, R_RSI);
++                if(ret == -1 && (errno == EPERM || errno == ENOSYS))
++                    errno = ENOSYS;
++                return ret;
++            }
++            #else
++            errno = ENOSYS;
++            return -1;
+             #endif
+         default:
+             if(!(warned&(1<<s))) {

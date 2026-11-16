@@ -1,0 +1,14 @@
+diff --git a/src/custommem.c b/src/custommem.c
+index aff6e11..acad977 100644
+--- a/src/custommem.c
++++ b/src/custommem.c
+@@ -3526,6 +3526,9 @@ EXPORT void* box_mmap(void *addr, size_t length, int prot, int flags, int fd, ss
+         LOCK_PROT();
+         rb_set(mapallmem, (uintptr_t)ret, ALIGN((uintptr_t)ret + length), MEM_RESERVED);
+         UNLOCK_PROT();
++    } else if(box64_wine) {
++        printf_log(LOG_INFO, "BOX64 mmap FAILED addr=%p len=%lu flags=%#x errno=%d\n",
++                   addr, (unsigned long)length, (unsigned)flags, errno);
+     }
+     mutex_unlock(&mutex_mmap);
+     return ret;

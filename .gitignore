@@ -1,0 +1,10 @@
+# upstream sources fetched by scripts/fetch-sources.sh
+upstream/
+.cache/
+
+# patch/build leftovers
+*.orig
+*.rej
+*.o
+*.so
+build/

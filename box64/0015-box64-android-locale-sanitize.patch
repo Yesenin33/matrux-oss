@@ -1,0 +1,78 @@
+diff --git a/src/wrapped/wrappedlibc.c b/src/wrapped/wrappedlibc.c
+--- a/src/wrapped/wrappedlibc.c
++++ b/src/wrapped/wrappedlibc.c
+@@ -4019,24 +4019,73 @@
+ #include <wctype.h>
+ 
+ // bionic has newlocale/freelocale/duplocale/uselocale but not the __-spellings.
++//
++// 0015: bionic's newlocale() is far stricter than glibc's. It rejects the call
++// (EINVAL -> NULL) unless (category_mask & ~LC_ALL_MASK) == 0, and bionic's
++// LC_ALL_MASK (0x1fbf: the six ISO C categories plus LC_PAPER..LC_IDENTIFICATION)
++// does NOT contain the LC_ALL bit (1 << LC_ALL == 0x40). glibc's newlocale() is
++// lenient, and libstdc++'s locale facet calls __newlocale(1 << LC_ALL, "C", NULL)
++// == 0x40 during static initialisation. bionic then returns NULL and libstdc++
++// throws:
++//   terminate called after throwing an instance of 'std::runtime_error'
++//   what(): locale::facet::_S_create_c_locale name not valid
++// Sanitize the mask and add fallbacks so a usable locale is always returned.
++#define MATRUX_LC_CATEGORY_MASK (LC_CTYPE_MASK | LC_NUMERIC_MASK | LC_TIME_MASK | \
++                                 LC_COLLATE_MASK | LC_MONETARY_MASK | LC_MESSAGES_MASK)
++
+ EXPORT locale_t my___newlocale(x64emu_t* emu, int category_mask, const char* locale_name, locale_t base)
+ {
+     (void)emu;
+-    return newlocale(category_mask, locale_name, base);
++    // bionic rejects a NULL name outright; an empty name means the C locale.
++    const char* name = (locale_name && locale_name[0]) ? locale_name : "C";
++
++    // 1) try exactly what the guest asked for.
++    locale_t loc = newlocale(category_mask, name, base);
++    if (loc) return loc;
++
++    // 2) drop the bits bionic does not know: keep only 0x3fbf (this clears the
++    //    LC_ALL bit 0x40 that glibc's libstdc++ passes, plus any high bits).
++    int mask = category_mask & 0x3fbf;
++    if (mask != category_mask) {
++        loc = newlocale(mask, name, base);
++        if (loc) return loc;
++    }
++
++    // 3) keep only the six ISO C categories bionic actually implements.
++    if (mask & ~MATRUX_LC_CATEGORY_MASK) {
++        mask &= MATRUX_LC_CATEGORY_MASK;
++        loc = newlocale(mask, name, base);
++        if (loc) return loc;
++    }
++
++    // 4) last resort: the C locale with bionic's complete mask (never NULL for
++    //    "C"), so an unsupported name degrades gracefully instead of throwing.
++    if (base) {
++        loc = newlocale(LC_ALL_MASK, "C", base);
++        if (loc) return loc;
++    }
++    return newlocale(LC_ALL_MASK, "C", NULL);
+ }
+ EXPORT void my___freelocale(x64emu_t* emu, locale_t loc)
+ {
+     (void)emu;
++    // bionic's freelocale() is free(); never free NULL or the magic global locale.
++    if (loc == NULL || loc == LC_GLOBAL_LOCALE)
++        return;
+     freelocale(loc);
+ }
+ EXPORT locale_t my___duplocale(x64emu_t* emu, locale_t loc)
+ {
+     (void)emu;
++    // bionic's duplocale() dereferences its argument; NULL means "no locale".
++    if (loc == NULL)
++        return NULL;
+     return duplocale(loc);
+ }
+ EXPORT locale_t my___uselocale(x64emu_t* emu, locale_t loc)
+ {
+     (void)emu;
++    // NULL is a valid "return the current locale" query; just forward it.
+     return uselocale(loc);
+ }
+ 

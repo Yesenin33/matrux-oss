@@ -1,0 +1,55 @@
+diff --git a/src/libtools/threads.c b/src/libtools/threads.c
+index 08317ed4..2a7b8f96 100644
+--- a/src/libtools/threads.c
++++ b/src/libtools/threads.c
+@@ -966,6 +966,50 @@ EXPORT int my_pthread_setaffinity_np_old(x64emu_t* emu, pthread_t thread, void*
+ {
+ 	return my_pthread_setaffinity_np(emu, thread, 128, cpuset);
+ }
++#else // ANDROID
++// ---------------------------------------------------------------------------
++// 0014: bionic exports neither pthread_setaffinity_np nor pthread_getaffinity_np
++// (it has only sched_{set,get}affinity), so the two implementations above are
++// compiled out. box64's GOM(pthread_setaffinity_np)/GOM(pthread_getaffinity_np)
++// registrations then resolve my_pthread_*_np to NULL and any guest importing
++// them fails to load with
++//   "Symbol pthread_setaffinity_np not found, cannot apply R_X86_64_JUMP_SLOT"
++// (observed for Mesa's libEGL.so.1). Reimplement on top of the bionic kernel
++// calls, mapping pthread_t -> kernel TID with pthread_gettid_np (also bionic
++// only). Return follows the pthread_*_np convention: 0 on success, else the
++// positive errno (not the -1/errno used by sched_*affinity).
++// ---------------------------------------------------------------------------
++#include <sched.h>
++
++EXPORT int my_pthread_getaffinity_np(x64emu_t* emu, pthread_t thread, size_t cpusetsize, void* cpuset)
++{
++	(void)emu;
++	pid_t tid = pthread_gettid_np(thread);
++	if(tid==0)
++		return 0;   // unknown thread: report success, this is only a hint
++	if(sched_getaffinity(tid, cpusetsize, (cpu_set_t*)cpuset)<0)
++		return errno;
++	return 0;
++}
++EXPORT int my_pthread_getaffinity_np_old(x64emu_t* emu, pthread_t thread, void* cpuset)
++{
++	return my_pthread_getaffinity_np(emu, thread, 128, cpuset);
++}
++
++EXPORT int my_pthread_setaffinity_np(x64emu_t* emu, pthread_t thread, size_t cpusetsize, void* cpuset)
++{
++	(void)emu;
++	pid_t tid = pthread_gettid_np(thread);
++	if(tid==0)
++		return 0;   // unknown thread: report success, this is only a hint
++	if(sched_setaffinity(tid, cpusetsize, (const cpu_set_t*)cpuset)<0)
++		return errno;
++	return 0;
++}
++EXPORT int my_pthread_setaffinity_np_old(x64emu_t* emu, pthread_t thread, void* cpuset)
++{
++	return my_pthread_setaffinity_np(emu, thread, 128, cpuset);
++}
+ #endif
+ 
+ //EXPORT int my_pthread_attr_setaffinity_np(x64emu_t* emu, void* attr, uint32_t cpusetsize, void* cpuset)

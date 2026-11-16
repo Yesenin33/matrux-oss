@@ -1,0 +1,665 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index c74391b6..20945a05 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -290,6 +290,12 @@ if(ARM_DYNAREC)
+ endif()
+ if(ANDROID)
+     add_definitions(-DANDROID)
++    # Guests are glibc x86_64 programs (Wine...): use the glibc guest ABI for
++    # sigaction/sigset/ucontext and x87 long double. -DANDROID_BIONIC_GUEST=ON
++    # restores upstream behaviour (x86_64 bionic guests).
++    if(NOT ANDROID_BIONIC_GUEST)
++        add_definitions(-DANDROID_GLIBC_GUEST)
++    endif()
+ endif()
+ if(TERMUX)
+     add_definitions(-DTERMUX)
+diff --git a/rebuild_wrappers.py b/rebuild_wrappers.py
+index 0614a283..37b899db 100755
+--- a/rebuild_wrappers.py
++++ b/rebuild_wrappers.py
+@@ -1143,7 +1143,7 @@ def main(root: str, files: Iterable[Filename], ver: str):
+ 			file.write("typedef " + td_types[v.get_convention().ident][v.get_convention().values.index(v[0])] + " (*" + name + ")"
+ 				+ "(" + ', '.join(td_types[v.get_convention().ident][v.get_convention().values.index(t)] for t in v[2:]) + ");\n")
+ 		if any_depends_on_ld:
+-			file.write("\n#if defined(HAVE_LD80BITS) || defined(ANDROID)\n")
++			file.write("\n#if defined(HAVE_LD80BITS) || (defined(ANDROID) && !defined(ANDROID_GLIBC_GUEST))\n")
+ 			for v in arr:
+ 				if all(c not in v for c in depends_on_ld):
+ 					continue
+@@ -1609,7 +1609,7 @@ def main(root: str, files: Iterable[Filename], ver: str):
+ 				else:
+ 					function_writer(file, v, v + "_t")
+ 			if any_depends_on_ld:
+-				file.write("\n#if defined(ANDROID)\n")
++				file.write("\n#if (defined(ANDROID) && !defined(ANDROID_GLIBC_GUEST))\n")
+ 				for c in vals_android:
+ 					for t in vals_android[c]:
+ 						vals[c][c.values.index(t)] = vals_android[c][t]
+@@ -1676,7 +1676,7 @@ def main(root: str, files: Iterable[Filename], ver: str):
+ 					continue
+ 				function_writer(file, vr, vf + "_t")
+ 			if any_depends_on_ld:
+-				file.write("\n#if defined(ANDROID)\n")
++				file.write("\n#if (defined(ANDROID) && !defined(ANDROID_GLIBC_GUEST))\n")
+ 				for c in vals_android:
+ 					for t in vals_android[c]:
+ 						vals[c][c.values.index(t)] = vals_android[c][t]
+diff --git a/src/emu/entrypoint.c b/src/emu/entrypoint.c
+index d0670fa3..9c05e4d6 100644
+--- a/src/emu/entrypoint.c
++++ b/src/emu/entrypoint.c
+@@ -30,7 +30,8 @@ void EXPORT my___libc_init(x64emu_t* emu, void* raw_args , void (*onexit)(void)
+     SetRBP(emu, Pop64(emu));    // restore RBP
+     emu->quit = 1; // finished!
+ }
+-#else
++#endif
++// glibc entry point: needed on ANDROID too, to run glibc x86_64 guests (Wine from Ubuntu/Winlator)
+ EXPORT int32_t my___libc_start_main(x64emu_t* emu, int (*main) (int, char * *, char * *), int argc, char * * ubp_av, void (*init) (void), void (*fini) (void), void (*rtld_fini) (void), void (* stack_end))
+ {
+     (void)argc; (void)ubp_av; (void)fini; (void)rtld_fini; (void)stack_end;
+@@ -145,4 +146,3 @@ int32_t EXPORT my32___libc_start_main(x64emu_t* emu, int *(main) (int, char * *,
+ }
+ #endif
+ #endif
+-#endif
+diff --git a/src/include/complext.h b/src/include/complext.h
+index 2f3d3b3b..c6f76d78 100644
+--- a/src/include/complext.h
++++ b/src/include/complext.h
+@@ -46,7 +46,7 @@ static inline void from_complex(x64emu_t* emu, complex_t v) {
+     emu->xmm[0].d[0]=v.r; 
+     emu->xmm[1].d[0]=v.i;
+ }
+-#ifdef ANDROID
++#if defined(ANDROID) && !defined(ANDROID_GLIBC_GUEST)
+ static inline void from_complexl(x64emu_t* emu, complexl_t v) {
+     memcpy(&emu->xmm[0], &v, 16*2); // what if AVX is present?
+ }
+diff --git a/src/include/signals.h b/src/include/signals.h
+index 23626a3c..a7152d07 100644
+--- a/src/include/signals.h
++++ b/src/include/signals.h
+@@ -8,7 +8,7 @@
+ 
+ typedef void (*sighandler_t)(int);
+ 
+-#ifdef ANDROID
++#if defined(ANDROID) && !defined(ANDROID_GLIBC_GUEST)
+ typedef struct x64_sigaction_s {
+ 	int sa_flags;
+ 	union {
+@@ -18,6 +18,18 @@ typedef struct x64_sigaction_s {
+ 	sigset_t sa_mask;
+ 	void (*sa_restorer)(void);
+ } x64_sigaction_t;
++#elif defined(ANDROID)
++// glibc x86_64 struct sigaction: 1024-bit sa_mask, bionic sigset_t is only 64 bits
++typedef struct x64_sigaction_s {
++	union {
++	  sighandler_t _sa_handler;
++	  void (*_sa_sigaction)(int, siginfo_t *, void *);
++	} _u;
++	sigset_t sa_mask;
++	uint8_t  sa_mask_pad[128 - sizeof(sigset_t)];
++	uint32_t sa_flags;
++	void (*sa_restorer)(void);
++} x64_sigaction_t;
+ #else
+ typedef struct x64_sigaction_s {
+ 	union {
+diff --git a/src/libtools/myalign.c b/src/libtools/myalign.c
+index bc427b89..94b979cd 100644
+--- a/src/libtools/myalign.c
++++ b/src/libtools/myalign.c
+@@ -124,7 +124,7 @@ void myStackAlign(x64emu_t* emu, const char* fmt, uint64_t* st, uint64_t* mystac
+                     mystack++;
+                 memcpy(mystack, st, 16);
+                 st+=2; mystack+=2;
+-                #elif defined(ANDROID)
++                #elif defined(ANDROID) && !defined(ANDROID_GLIBC_GUEST)
+                 // there is 128bits long double on native and x64 side
+                 // need to align stacks to 128bits boundaries
+                 if((((uintptr_t)mystack)&0xf)!=0)
+@@ -382,7 +382,7 @@ void myStackAlignW(x64emu_t* emu, const char* fmt, uint64_t* st, uint64_t* mysta
+                     mystack++;
+                 memcpy(mystack, st, 16);
+                 st+=2; mystack+=2;
+-                #elif defined(ANDROID)
++                #elif defined(ANDROID) && !defined(ANDROID_GLIBC_GUEST)
+                 // there is 128bits long double on native and x64 side
+                 // need to align stacks to 128bits boundaries
+                 if((((uintptr_t)mystack)&0xf)!=0)
+@@ -775,7 +775,7 @@ void myStackAlignValist(x64emu_t* emu, const char* fmt, uint64_t* mystack, x64_v
+                     mystack++;
+                 memcpy(mystack, st, 16);
+                 st+=2; mystack+=2;
+-                #elif defined(ANDROID)
++                #elif defined(ANDROID) && !defined(ANDROID_GLIBC_GUEST)
+                 // there is 128bits long double on native and x64 side
+                 // need to align stacks to 128bits boundaries
+                 if((((uintptr_t)mystack)&0xf)!=0)
+@@ -935,7 +935,7 @@ void myStackAlignWValist(x64emu_t* emu, const char* fmt, uint64_t* mystack, x64_
+                     mystack++;
+                 memcpy(mystack, st, 16);
+                 st+=2; mystack+=2;
+-                #elif defined(ANDROID)
++                #elif defined(ANDROID) && !defined(ANDROID_GLIBC_GUEST)
+                 // there is 128bits long double on native and x64 side
+                 // need to align stacks to 128bits boundaries
+                 if((((uintptr_t)mystack)&0xf)!=0)
+diff --git a/src/libtools/signal_private.h b/src/libtools/signal_private.h
+index 9a41afc0..dbbce5ab 100644
+--- a/src/libtools/signal_private.h
++++ b/src/libtools/signal_private.h
+@@ -186,12 +186,14 @@ typedef struct x64_mcontext_s
+ } x64_mcontext_t;
+ 
+ // /!\ signal sig_set is different than glibc __sig_set
+-#ifndef ANDROID
+-#define _NSIG_WORDS (1024 / (sizeof(unsigned long int)*8))
++#if !defined(ANDROID) || defined(ANDROID_GLIBC_GUEST)
++#define X64_NSIG_WORDS (1024 / (sizeof(unsigned long int)*8))
++#else
++#define X64_NSIG_WORDS _NSIG_WORDS
+ #endif
+ 
+ typedef struct {
+-    unsigned long int sig[_NSIG_WORDS];
++    unsigned long int sig[X64_NSIG_WORDS];
+ } x64_sigset_t;
+ 
+ typedef struct x64_ucontext_s
+@@ -202,7 +204,7 @@ typedef struct x64_ucontext_s
+     x64_mcontext_t          uc_mcontext;
+     x64_sigset_t            uc_sigmask;
+     struct x64_libc_fpstate xstate;
+-    #ifndef ANDROID
++    #if !defined(ANDROID) || defined(ANDROID_GLIBC_GUEST)
+     uint64_t                ssp[4];
+     #endif
+ } x64_ucontext_t;
+diff --git a/src/wrapped/wrappedlibc.c b/src/wrapped/wrappedlibc.c
+index 65f41f15..3ce47de5 100644
+--- a/src/wrapped/wrappedlibc.c
++++ b/src/wrapped/wrappedlibc.c
+@@ -3522,8 +3522,284 @@ void InitCpuModel()
+ #endif
+ 
+ #ifdef ANDROID
++// ---------------------------------------------------------------------------
++// glibc x86_64 guests (Wine, Steam...) on a bionic host.
++// Upstream ANDROID build only targets x86_64 *bionic* guests (__libc_init).
++// Here: glibc-only symbols and glibc-numbered constants mapped onto bionic.
++// Set BOX64_BIONIC_GUEST=1 to disable the constant remapping.
++// ---------------------------------------------------------------------------
++#include <netdb.h>
++#include <langinfo.h>
++#include <assert.h>
++#include <limits.h>
++
++int box64_glibc_guest = 1;
++
++// glibc <ctype.h> tables, index -128..255
++#define GL_ISupper  0x0100
++#define GL_ISlower  0x0200
++#define GL_ISalpha  0x0400
++#define GL_ISdigit  0x0800
++#define GL_ISxdigit 0x1000
++#define GL_ISspace  0x2000
++#define GL_ISprint  0x4000
++#define GL_ISgraph  0x8000
++#define GL_ISblank  0x0001
++#define GL_IScntrl  0x0002
++#define GL_ISpunct  0x0004
++#define GL_ISalnum  0x0008
++static unsigned short glibc_ctype_b[384];
++static int32_t glibc_ctype_tolower[384];
++static int32_t glibc_ctype_toupper[384];
++EXPORT const unsigned short int *my___ctype_b = glibc_ctype_b + 128;
++EXPORT const int32_t *my___ctype_tolower = glibc_ctype_tolower + 128;
++EXPORT const int32_t *my___ctype_toupper = glibc_ctype_toupper + 128;
++
+ void ctSetup()
+ {
++    const char* bionic = getenv("BOX64_BIONIC_GUEST");
++    if(bionic && bionic[0]=='1')
++        box64_glibc_guest = 0;
++    for(int i=-128; i<256; ++i) {
++        unsigned short v = 0;
++        // glibc maps signed chars (except EOF) to their unsigned value
++        int32_t lo = (i<0 && i!=-1) ? i+256 : i, up = lo;
++        if(i>=0 && i<128) {   // "C" locale: only ASCII is classified
++            if(isupper(i))  v |= GL_ISupper;
++            if(islower(i))  v |= GL_ISlower;
++            if(isalpha(i))  v |= GL_ISalpha;
++            if(isdigit(i))  v |= GL_ISdigit;
++            if(isxdigit(i)) v |= GL_ISxdigit;
++            if(isspace(i))  v |= GL_ISspace;
++            if(isprint(i))  v |= GL_ISprint;
++            if(isgraph(i))  v |= GL_ISgraph;
++            if(isblank(i))  v |= GL_ISblank;
++            if(iscntrl(i))  v |= GL_IScntrl;
++            if(ispunct(i))  v |= GL_ISpunct;
++            if(isalnum(i))  v |= GL_ISalnum;
++            if(i>='A' && i<='Z') lo = i + 32;
++            if(i>='a' && i<='z') up = i - 32;
++        }
++        glibc_ctype_b[i+128] = v;
++        glibc_ctype_tolower[i+128] = lo;
++        glibc_ctype_toupper[i+128] = up;
++    }
++}
++EXPORT void* my___ctype_b_loc(void)       { return (void*)&my___ctype_b; }
++EXPORT void* my___ctype_tolower_loc(void) { return (void*)&my___ctype_tolower; }
++EXPORT void* my___ctype_toupper_loc(void) { return (void*)&my___ctype_toupper; }
++
++// errno / h_errno / assert
++EXPORT void* my___errno_location(void)   { return (void*)__errno(); }
++EXPORT void* my___h_errno_location(void) { return (void*)__get_h_errno(); }
++EXPORT void my___assert_fail(const char* assertion, const char* file, unsigned int line, const char* function)
++{
++    __assert2(file, (int)line, function?function:"?", assertion);
++}
++// POSIX basename (may modify its argument, like glibc's __xpg_basename)
++EXPORT char* my___xpg_basename(char* path)
++{
++    static char dot[] = ".";
++    if(!path || !*path) return dot;
++    size_t len = strlen(path);
++    while(len>1 && path[len-1]=='/') path[--len] = 0;
++    char* p = strrchr(path, '/');
++    return (p && p[1]) ? p+1 : path;
++}
++
++// resolver internals: bionic has no public _res, give a zeroed glibc-sized struct
++static char glibc_res_state[1024];
++EXPORT void* my___res_state(void) { return glibc_res_state; }
++EXPORT int my___res_init(void) { return 0; }
++
++// shm_open: no /dev/shm on Android, use a private directory (needed by esync)
++static int android_shm_path(const char* name, char* buff, size_t sz)
++{
++    const char* dir = getenv("BOX64_SHM_DIR");
++    if(!dir || !*dir) dir = getenv("TMPDIR");
++    if(!dir || !*dir) dir = "/data/local/tmp";
++    if(!name) { errno = EINVAL; return -1; }
++    while(*name=='/') ++name;
++    if(!*name || strchr(name, '/')) { errno = EINVAL; return -1; }
++    if(snprintf(buff, sz, "%s/shm-%s", dir, name) >= (int)sz) { errno = ENAMETOOLONG; return -1; }
++    return 0;
++}
++EXPORT int my_shm_open(const char* name, int oflag, uint32_t mode)
++{
++    char path[PATH_MAX];
++    if(android_shm_path(name, path, sizeof(path))) return -1;
++    return open(path, oflag | O_NOFOLLOW | O_CLOEXEC, (mode_t)mode);
++}
++EXPORT int my_shm_unlink(const char* name)
++{
++    char path[PATH_MAX];
++    if(android_shm_path(name, path, sizeof(path))) return -1;
++    return unlink(path);
++}
++
++// res_query: no public resolver API in bionic, report "no recovery" (dnsapi falls back)
++EXPORT int my_android_res_query(const char* dname, int cls, int type, unsigned char* answer, int anslen)
++{
++    (void)dname; (void)cls; (void)type; (void)answer; (void)anslen;
++    *__get_h_errno() = NO_RECOVERY;
++    return -1;
++}
++
++// nl_langinfo: glibc nl_item = (category<<16)|index
++EXPORT void* my_nl_langinfo(int item)
++{
++    if(!box64_glibc_guest) return nl_langinfo(item);
++    int n = -1;
++    int cat = item>>16, idx = item&0xffff;
++    switch(cat) {
++        case 0: if(idx==14) n = CODESET; break;                         // LC_CTYPE
++        case 1: if(idx==0) n = RADIXCHAR; else if(idx==1) n = THOUSEP; break; // LC_NUMERIC
++        case 2:                                                          // LC_TIME
++            if(idx<=6)       n = ABDAY_1 + idx;
++            else if(idx<=13) n = DAY_1 + (idx-7);
++            else if(idx<=25) n = ABMON_1 + (idx-14);
++            else if(idx<=37) n = MON_1 + (idx-26);
++            else switch(idx) {
++                case 38: n = AM_STR; break;
++                case 39: n = PM_STR; break;
++                case 40: n = D_T_FMT; break;
++                case 41: n = D_FMT; break;
++                case 42: n = T_FMT; break;
++                case 43: n = T_FMT_AMPM; break;
++            }
++            break;
++        case 4: if(idx==15) n = CRNCYSTR; break;                        // LC_MONETARY
++        case 5: if(idx==0) n = YESEXPR; else if(idx==1) n = NOEXPR; break; // LC_MESSAGES
++    }
++    if(n<0) return (void*)"";
++    return nl_langinfo(n);
++}
++
++// sysconf: glibc _SC_* -> bionic _SC_*
++int android_sc_from_glibc(int what)
++{
++    switch(what) {
++        case 0:   return _SC_ARG_MAX;
++        case 1:   return _SC_CHILD_MAX;
++        case 2:   return _SC_CLK_TCK;
++        case 3:   return _SC_NGROUPS_MAX;
++        case 4:   return _SC_OPEN_MAX;
++        case 5:   return _SC_STREAM_MAX;
++        case 30:  return _SC_PAGESIZE;
++        case 43:  return _SC_LINE_MAX;
++        case 60:  return _SC_IOV_MAX;
++        case 69:  return _SC_GETGR_R_SIZE_MAX;
++        case 70:  return _SC_GETPW_R_SIZE_MAX;
++        case 75:  return _SC_THREAD_STACK_MIN;
++        case 83:  return _SC_NPROCESSORS_CONF;
++        case 84:  return _SC_NPROCESSORS_ONLN;
++        case 85:  return _SC_PHYS_PAGES;
++        case 86:  return _SC_AVPHYS_PAGES;
++        case 149: return _SC_MONOTONIC_CLOCK;
++        case 180: return _SC_HOST_NAME_MAX;
++        case 190: return _SC_LEVEL1_DCACHE_LINESIZE;
++    }
++    return -1;
++}
++
++// getaddrinfo & co: glibc and bionic differ in AI_/NI_/EAI_ values,
++// and struct addrinfo has ai_addr/ai_canonname swapped
++#define GL_AI_PASSIVE     0x0001
++#define GL_AI_CANONNAME   0x0002
++#define GL_AI_NUMERICHOST 0x0004
++#define GL_AI_V4MAPPED    0x0008
++#define GL_AI_ALL         0x0010
++#define GL_AI_ADDRCONFIG  0x0020
++#define GL_AI_NUMERICSERV 0x0400
++static int gai_err_to_glibc(int r)
++{
++    switch(r) {
++        case 0:              return 0;
++        case EAI_BADFLAGS:   return -1;
++        case EAI_NONAME:     return -2;
++        case EAI_AGAIN:      return -3;
++        case EAI_FAIL:       return -4;
++        case EAI_NODATA:     return -5;
++        case EAI_FAMILY:     return -6;
++        case EAI_SOCKTYPE:   return -7;
++        case EAI_SERVICE:    return -8;
++        case EAI_ADDRFAMILY: return -9;
++        case EAI_MEMORY:     return -10;
++        case EAI_SYSTEM:     return -11;
++        case EAI_OVERFLOW:   return -12;
++    }
++    return -4;
++}
++static int gai_err_from_glibc(int r)
++{
++    switch(r) {
++        case 0:   return 0;
++        case -1:  return EAI_BADFLAGS;
++        case -2:  return EAI_NONAME;
++        case -3:  return EAI_AGAIN;
++        case -4:  return EAI_FAIL;
++        case -5:  return EAI_NODATA;
++        case -6:  return EAI_FAMILY;
++        case -7:  return EAI_SOCKTYPE;
++        case -8:  return EAI_SERVICE;
++        case -9:  return EAI_ADDRFAMILY;
++        case -10: return EAI_MEMORY;
++        case -11: return EAI_SYSTEM;
++        case -12: return EAI_OVERFLOW;
++    }
++    return r;
++}
++static void swap_addrinfo(struct addrinfo* ai)
++{
++    // ai_next is at the same offset in both layouts
++    for(; ai; ai = ai->ai_next) {
++        void* tmp = ai->ai_addr;
++        ai->ai_addr = (struct sockaddr*)ai->ai_canonname;
++        ai->ai_canonname = (char*)tmp;
++    }
++}
++EXPORT int my_getaddrinfo(const char* node, const char* service, const struct addrinfo* hints, struct addrinfo** res)
++{
++    if(!box64_glibc_guest) return getaddrinfo(node, service, hints, res);
++    struct addrinfo h, *ph = NULL;
++    if(hints) {
++        memset(&h, 0, sizeof(h));
++        int f = hints->ai_flags;
++        h.ai_flags = ((f&GL_AI_PASSIVE)?AI_PASSIVE:0) | ((f&GL_AI_CANONNAME)?AI_CANONNAME:0)
++                   | ((f&GL_AI_NUMERICHOST)?AI_NUMERICHOST:0) | ((f&GL_AI_NUMERICSERV)?AI_NUMERICSERV:0)
++                   | ((f&GL_AI_ADDRCONFIG)?AI_ADDRCONFIG:0);
++        // AI_V4MAPPED/AI_ALL are rejected by bionic getaddrinfo: dropped
++        h.ai_family = hints->ai_family;
++        h.ai_socktype = hints->ai_socktype;
++        h.ai_protocol = hints->ai_protocol;
++        ph = &h;
++    }
++    int r = getaddrinfo(node, service, ph, res);
++    if(!r && res) swap_addrinfo(*res);
++    return gai_err_to_glibc(r);
++}
++EXPORT void my_freeaddrinfo(struct addrinfo* ai)
++{
++    if(!ai) return;
++    if(box64_glibc_guest) swap_addrinfo(ai);
++    freeaddrinfo(ai);
++}
++EXPORT void* my_gai_strerror(int err)
++{
++    return (void*)gai_strerror(box64_glibc_guest?gai_err_from_glibc(err):err);
++}
++#define GL_NI_NUMERICHOST 1
++#define GL_NI_NUMERICSERV 2
++#define GL_NI_NOFQDN      4
++#define GL_NI_NAMEREQD    8
++#define GL_NI_DGRAM       16
++EXPORT int my_getnameinfo(void* sa, uint32_t salen, void* host, uint32_t hostlen, void* serv, uint32_t servlen, int flags)
++{
++    if(!box64_glibc_guest) return getnameinfo(sa, salen, host, hostlen, serv, servlen, flags);
++    int f = ((flags&GL_NI_NUMERICHOST)?NI_NUMERICHOST:0) | ((flags&GL_NI_NUMERICSERV)?NI_NUMERICSERV:0)
++          | ((flags&GL_NI_NOFQDN)?NI_NOFQDN:0) | ((flags&GL_NI_NAMEREQD)?NI_NAMEREQD:0)
++          | ((flags&GL_NI_DGRAM)?NI_DGRAM:0);
++    return gai_err_to_glibc(getnameinfo(sa, salen, host, hostlen, serv, servlen, f));
+ }
+ #else
+ EXPORT const unsigned short int *my___ctype_b;
+@@ -5290,6 +5566,13 @@ EXPORT int my_getpagesize(x64emu_t* emu) {
+ EXPORT int my___getpagesize(x64emu_t* emu) __attribute__((alias("my_getpagesize")));
+ 
+ EXPORT long my_sysconf(x64emu_t* emu, int what) {
++#ifdef ANDROID
++    // glibc guest: _SC_* numbering differs from bionic
++    if(box64_glibc_guest) {
++        what = android_sc_from_glibc(what);
++        if(what<0) { errno = EINVAL; return -1; }
++    }
++#endif
+     if(what==_SC_PAGESIZE) {
+         return X86_PAGE_SIZE;
+     }
+diff --git a/src/wrapped/wrappedlibc_private.h b/src/wrapped/wrappedlibc_private.h
+index 84a7e7e6..acd3f9ef 100644
+--- a/src/wrapped/wrappedlibc_private.h
++++ b/src/wrapped/wrappedlibc_private.h
+@@ -54,7 +54,11 @@ GOM(__asprintf, iFEppV)
+ GOWM(asprintf, iFEppV)
+ GOM(__asprintf_chk, iFEpipV)
+ GO(__assert, vFppi)
++#ifdef ANDROID
++GOM(__assert_fail, vFppup)
++#else
+ GO(__assert_fail, vFppup)
++#endif
+ GO(__assert_perror_fail, vFipup)
+ GOM(atexit, iFEp)
+ GOM(at_quick_exit, iFEp)
+@@ -218,13 +222,25 @@ DATA(_ctype_, 8)
+ #else
+ DATA(__ctype_b, 8)
+ #endif
++#ifdef ANDROID
++GOM(__ctype_b_loc, pFv)
++#else
+ GO(__ctype_b_loc, pFv)
++#endif
+ GO(__ctype_get_mb_cur_max, LFv)
+ //GO(__ctype_init, 
+ DATAM(__ctype_tolower, 8)
++#ifdef ANDROID
++GOM(__ctype_tolower_loc, pFv)
++#else
+ GO(__ctype_tolower_loc, pFv)
++#endif
+ DATAM(__ctype_toupper, 8)
++#ifdef ANDROID
++GOM(__ctype_toupper_loc, pFv)
++#else
+ GO(__ctype_toupper_loc, pFv)
++#endif
+ //DATAB(__curbrk, 
+ GO(cuserid, pFp)
+ GOM(__cxa_atexit, iFEppp)
+@@ -337,7 +353,11 @@ GO(erand48, dFp)
+ GOW(erand48_r, iFppp)
+ GOM(err, vFEipV)
+ //DATAB(errno, 
++#ifdef ANDROID
++GOM(__errno_location, pFv)
++#else
+ GO(__errno_location, pFv)
++#endif
+ GOWM(error, vFEiipV)
+ GOWM(error_at_line, vFEiipupV)
+ //DATAB(error_message_count, 4)
+@@ -491,7 +511,11 @@ GO(free, vFp)
+ GO(free_aligned_sized, vFpLL)
+ GO(free_sized, vFpL)
+ #endif
++#ifdef ANDROID
++GOM(freeaddrinfo, vFp)
++#else
+ GO(freeaddrinfo, vFp)
++#endif
+ GOW(freeifaddrs, vFp)
+ GO(__freelocale, vFp)
+ GOW(freelocale, vFp)
+@@ -556,14 +580,22 @@ GOM(__fxstatat64, iFEiippi)
+ //GO(__gai_sigqueue, 
+ GO(gai_cancel, iFp)
+ GO(gai_error, iFp)
++#ifdef ANDROID
++GOM(gai_strerror, pFi)
++#else
+ GO(gai_strerror, pFi)
++#endif
+ GO(gai_suspend, iFpip)
+ //GO(__gconv_get_alias_db, 
+ //GO(__gconv_get_cache, 
+ //GO(__gconv_get_modules_db, 
+ //GO(__gconv_transliterate, 
+ GO(gcvt, pFdip)
++#ifdef ANDROID
++GOM(getaddrinfo, iFpppp)
++#else
+ GO(getaddrinfo, iFpppp)
++#endif
+ //GOM(getaddrinfo_a, iFipip)
+ GO(getaliasbyname, pFp)
+ GO(getaliasbyname_r, iFpppLp)
+@@ -647,7 +679,11 @@ GOW(getmntent_r, pFSppi)
+ //GO(getmsg, 
+ GO(get_myaddress, iFp)
+ #endif
++#ifdef ANDROID
++GOM(getnameinfo, iFpupupui)
++#else
+ GO(getnameinfo, iFpupupui)
++#endif
+ GO(getnetbyaddr, pFui)
+ GO(getnetbyaddr_r, iFuippLpp)
+ GO(getnetbyname, pFp)
+@@ -804,7 +840,11 @@ GOW(hdestroy, vFv)
+ GOW(hdestroy_r, vFp)
+ //DATA(h_errlist, 
+ //DATAB(__h_errno, 
++#ifdef ANDROID
++GOM(__h_errno_location, pFv)
++#else
+ GO(__h_errno_location, pFv)
++#endif
+ GO(herror, vFp)
+ #ifdef STATICBUILD
+ //GO(host2netname, 
+@@ -1439,7 +1479,11 @@ GOM(nftw64, iFEppii)
+ GOW(ngettext, pFppL)
+ GO(nice, iFi)
+ //DATAB(_nl_domain_bindings, 
++#ifdef ANDROID
++GOM(nl_langinfo, pFi)
++#else
+ GO(nl_langinfo, pFi)
++#endif
+ GO(__nl_langinfo_l, pFip)
+ GOW(nl_langinfo_l, pFip)
+ DATAB(_nl_msg_cat_cntr, 4)
+@@ -1735,7 +1779,11 @@ GOW(re_set_registers, vFppupp)
+ GOW(re_set_syntax, LFL)
+ //DATAB(_res_hconf, 
+ GO(__res_iclose, vFpi)
++#ifdef ANDROID
++GOM(__res_init, iFv)
++#else
+ GO(__res_init, iFv)
++#endif
+ GO(__res_nclose, vFp)
+ GO(__res_ninit, iFp)
+ GO(res_nsearch, iFppiipi)
+@@ -1749,7 +1797,11 @@ GO(res_nsearch, iFppiipi)
+ #else
+ GO(__res_randomid, uFv)
+ #endif
++#ifdef ANDROID
++GOM(__res_state, pFv)
++#else
+ GO(__res_state, pFv)
++#endif
+ //DATAB(re_syntax_options, 8)
+ GOW(revoke, iFp)
+ GO(rewind, vFS)
+@@ -2716,7 +2768,11 @@ GO(xdr_void, iFv)
+ GOM(__xmknod, iFEipup)
+ GOM(__xmknodat, iFEiipup)
+ #endif
++#ifdef ANDROID
++GOM(__xpg_basename, pFp)
++#else
+ GO(__xpg_basename, pFp)
++#endif
+ GOW(__xpg_sigpause, iFi)
+ GO(__xpg_strerror_r, pFipL)
+ //GOM(xprt_register, vFp)
+@@ -2771,6 +2827,17 @@ GO(android_set_abort_message, vFp)
+ //GO(__errno, 
+ //GO(android_set_abort_message, vFp)
+ #endif
++// glibc 2.34+ exports shm_open/shm_unlink from libc.so.6, Android has no /dev/shm
++#ifdef ANDROID
++GOM(shm_open, iFpOu)
++GOM(shm_unlink, iFp)
++// glibc 2.34+ exports res_query from libc.so.6 (dnsapi.so needs it); bionic has none
++GO2(res_query, iFpiipi, my_android_res_query)
++#else
++GO(shm_open, iFpOu)
++GO(shm_unlink, iFp)
++GO(res_query, iFpiipi)
++#endif
+ #ifdef STATICBUILD
+ GO(dummy_pFLp, pFLp)
+ GO(dummy_pFpLLp, pFpLLp)

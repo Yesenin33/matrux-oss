@@ -1,0 +1,526 @@
+diff --git a/src/wrapped/wrappedlibc.c b/src/wrapped/wrappedlibc.c
+index 88465b72..13c075af 100644
+--- a/src/wrapped/wrappedlibc.c
++++ b/src/wrapped/wrappedlibc.c
+@@ -4001,6 +4001,182 @@ EXPORT int my_euidaccess(x64emu_t* emu, const char* path, int mode)
+ }
+ #endif
+ 
++#ifdef ANDROID
++// ---------------------------------------------------------------------------
++// 0013: further glibc symbols needed by our x86_64 guests (Mesa's libEGL etc.)
++// that bionic exports neither under the __-prefixed name nor at all.
++//   * the *_l (locale) family simply forwards to the bionic non-locale / *_l
++//     equivalent (the locale argument is honoured where bionic understands it);
++//   * __*_chk are the fortified variants -> call the base function, skipping
++//     the (guest-side) buffer-overflow check;
++//   * strtof128/strfromf128 are absent from bionic (no _Float128) -> stubs;
++//   * gettext()/dgettext() return the untranslated msgid, the rest are no-ops;
++//   * ZSTD_trace_* are optional libzstd hooks -> no-op stubs.
++// ---------------------------------------------------------------------------
++#include <locale.h>
++#include <langinfo.h>
++#include <time.h>
++#include <wctype.h>
++
++// bionic has newlocale/freelocale/duplocale/uselocale but not the __-spellings.
++EXPORT locale_t my___newlocale(x64emu_t* emu, int category_mask, const char* locale_name, locale_t base)
++{
++    (void)emu;
++    return newlocale(category_mask, locale_name, base);
++}
++EXPORT void my___freelocale(x64emu_t* emu, locale_t loc)
++{
++    (void)emu;
++    freelocale(loc);
++}
++EXPORT locale_t my___duplocale(x64emu_t* emu, locale_t loc)
++{
++    (void)emu;
++    return duplocale(loc);
++}
++EXPORT locale_t my___uselocale(x64emu_t* emu, locale_t loc)
++{
++    (void)emu;
++    return uselocale(loc);
++}
++
++// __<fn>_l: same as the bionic <fn>_l (or plain <fn>).
++EXPORT char* my___nl_langinfo_l(x64emu_t* emu, int item, locale_t loc)
++{
++    (void)emu;
++    return nl_langinfo_l((nl_item)item, loc);
++}
++EXPORT double my___strtod_l(x64emu_t* emu, const char* nptr, char** endptr, locale_t loc)
++{
++    (void)emu;
++    return strtod_l(nptr, endptr, loc);
++}
++EXPORT float my___strtof_l(x64emu_t* emu, const char* nptr, char** endptr, locale_t loc)
++{
++    (void)emu;
++    return strtof_l(nptr, endptr, loc);
++}
++EXPORT int my___strcoll_l(x64emu_t* emu, const char* a, const char* b, locale_t loc)
++{
++    (void)emu;
++    return strcoll_l(a, b, loc);
++}
++EXPORT size_t my___strxfrm_l(x64emu_t* emu, char* dest, const char* src, size_t n, locale_t loc)
++{
++    (void)emu;
++    return strxfrm_l(dest, src, n, loc);
++}
++EXPORT size_t my___strftime_l(x64emu_t* emu, char* s, size_t max, const char* format, const struct tm* tm, locale_t loc)
++{
++    (void)emu;
++    return strftime_l(s, max, format, tm, loc);
++}
++EXPORT size_t my___wcsftime_l(x64emu_t* emu, wchar_t* s, size_t max, const wchar_t* format, const struct tm* tm, locale_t loc)
++{
++    (void)emu;
++    return wcsftime_l(s, max, format, tm, loc);
++}
++EXPORT int my___wcscoll_l(x64emu_t* emu, const wchar_t* a, const wchar_t* b, locale_t loc)
++{
++    (void)emu;
++    return wcscoll_l(a, b, loc);
++}
++EXPORT size_t my___wcsxfrm_l(x64emu_t* emu, wchar_t* dest, const wchar_t* src, size_t n, locale_t loc)
++{
++    (void)emu;
++    return wcsxfrm_l(dest, src, n, loc);
++}
++EXPORT wint_t my___towlower_l(x64emu_t* emu, wint_t wc, locale_t loc)
++{
++    (void)emu;
++    return towlower_l(wc, loc);
++}
++EXPORT wint_t my___towupper_l(x64emu_t* emu, wint_t wc, locale_t loc)
++{
++    (void)emu;
++    return towupper_l(wc, loc);
++}
++EXPORT int my___iswctype_l(x64emu_t* emu, wint_t wc, wctype_t type, locale_t loc)
++{
++    (void)emu;
++    return iswctype_l(wc, type, loc);
++}
++EXPORT wctype_t my___wctype_l(x64emu_t* emu, const char* name, locale_t loc)
++{
++    (void)emu;
++    return wctype_l(name, loc);
++}
++
++// fortified variants: run the base function without the __*_chk overflow check.
++EXPORT wchar_t* my___wmemset_chk(x64emu_t* emu, wchar_t* s, wchar_t c, size_t n, size_t dstlen)
++{
++    (void)emu; (void)dstlen;
++    return wmemset(s, c, n);
++}
++EXPORT wchar_t* my___wmemcpy_chk(x64emu_t* emu, wchar_t* dest, const wchar_t* src, size_t n, size_t dstlen)
++{
++    (void)emu; (void)dstlen;
++    return wmemcpy(dest, src, n);
++}
++EXPORT size_t my___mbsrtowcs_chk(x64emu_t* emu, wchar_t* dst, const char** src, size_t len, mbstate_t* ps, size_t dstlen)
++{
++    (void)emu; (void)dstlen;
++    return mbsrtowcs(dst, src, len, ps);
++}
++
++// _Float128 variants: bionic has no _Float128; stub out (parse -> 0, format -> 0).
++EXPORT long double my_strtof128(x64emu_t* emu, const char* nptr, char** endptr)
++{
++    (void)emu; (void)nptr; (void)endptr;
++    return 0.0L;
++}
++EXPORT int my_strfromf128(x64emu_t* emu, char* s, size_t n, const char* format, long double fp)
++{
++    (void)emu; (void)s; (void)n; (void)format; (void)fp;
++    return 0;
++}
++
++// libintl: no bionic equivalent. gettext/dgettext return the untranslated msgid.
++EXPORT char* my_gettext(x64emu_t* emu, const char* msgid)
++{
++    (void)emu;
++    return (char*)msgid;
++}
++EXPORT char* my_dgettext(x64emu_t* emu, const char* domainname, const char* msgid)
++{
++    (void)emu; (void)domainname;
++    return (char*)msgid;
++}
++EXPORT char* my_bindtextdomain(x64emu_t* emu, const char* domainname, const char* dirname)
++{
++    (void)emu; (void)domainname; (void)dirname;
++    return NULL;
++}
++EXPORT char* my_bind_textdomain_codeset(x64emu_t* emu, const char* domainname, const char* codeset)
++{
++    (void)emu; (void)domainname; (void)codeset;
++    return NULL;
++}
++
++// optional libzstd trace hooks: no-ops.
++EXPORT void my_ZSTD_trace_decompress_begin(x64emu_t* emu, void* cctx)
++{
++    (void)emu; (void)cctx;
++}
++EXPORT void my_ZSTD_trace_decompress_end(x64emu_t* emu, void* cctx)
++{
++    (void)emu; (void)cctx;
++}
++EXPORT void my_ZSTD_trace_compress_begin(x64emu_t* emu, void* cctx)
++{
++    (void)emu; (void)cctx;
++}
++EXPORT void my_ZSTD_trace_compress_end(x64emu_t* emu, void* cctx)
++{
++    (void)emu; (void)cctx;
++}
++#endif
++
+ EXPORT void* my_realpath(x64emu_t* emu, void* path, void* resolved_path)
+ {
+     if(path && isProcSelf(path, "exe")) {
+diff --git a/src/wrapped/wrappedlibc_private.h b/src/wrapped/wrappedlibc_private.h
+index 3140992c..b05ab0ff 100644
+--- a/src/wrapped/wrappedlibc_private.h
++++ b/src/wrapped/wrappedlibc_private.h
+@@ -85,8 +85,18 @@ GO(bcopy, vFppL)
+ //GO(bdflush, 
+ GOW(bind, iFipu)
+ GO(bindresvport, iFip)
++#ifdef ANDROID
++// bionic has no bindtextdomain; stub
++GOM(bindtextdomain, pFEpp)
++#else
+ GOW(bindtextdomain, pFpp)
++#endif
++#ifdef ANDROID
++// bionic has no bind_textdomain_codeset; stub
++GOM(bind_textdomain_codeset, pFEpp)
++#else
+ GOW(bind_textdomain_codeset, pFpp)
++#endif
+ GOW(brk, iFp)
+ //GO(__bsd_getpgrp, 
+ GO2(bsd_signal, pFEip, my_signal)
+@@ -264,7 +274,12 @@ GOM(delete_module, iFEpu)
+ GO(des_setparity, vFp)
+ #endif
+ GO(__dgettext, pFpp)
++#ifdef ANDROID
++// bionic has no dgettext; stub returns msgid
++GOM(dgettext, pFEpp)
++#else
+ GOW(dgettext, pFpp)
++#endif
+ GO(difftime, dFll)
+ GO(dirfd, iFp)
+ GO(dirname, pFp)
+@@ -295,7 +310,12 @@ GOW(dup, iFi)
+ GO(__dup2, iFii)
+ GOW(dup2, iFii)
+ GOW(dup3, iFiiO)
++#ifdef ANDROID
++// bionic has duplocale() but not __duplocale
++GOM(__duplocale, pFEp)
++#else
+ GO(__duplocale, pFp)
++#endif
+ GOW(duplocale, pFp)
+ GO(dysize, iFi)
+ #ifdef ANDROID
+@@ -533,7 +553,12 @@ GOM(freeaddrinfo, vFp)
+ GO(freeaddrinfo, vFp)
+ #endif
+ GOW(freeifaddrs, vFp)
++#ifdef ANDROID
++// bionic has freelocale() but not __freelocale
++GOM(__freelocale, vFEp)
++#else
+ GO(__freelocale, vFp)
++#endif
+ GOW(freelocale, vFp)
+ GO(fremovexattr, iFip)
+ GO(freopen, SFppS)
+@@ -806,7 +831,12 @@ GO(getspent_r, iFppLp)
+ GO(getspnam, pFp)
+ GO(getspnam_r, iFpppLp)
+ GO(getsubopt, iFppp)
++#ifdef ANDROID
++// bionic has no gettext; stub returns msgid
++GOM(gettext, pFEp)
++#else
+ GOW(gettext, pFp)
++#endif
+ GOW(gettid, iFv)
+ GO(__gettimeofday, iFpp)
+ GO(gettimeofday, iFpp)
+@@ -1171,7 +1201,12 @@ GOW(iswcntrl, iFu)
+ GOW(iswcntrl_l, iFup)
+ //GO(__iswctype, 
+ GOW(iswctype, iFuL)
++#ifdef ANDROID
++// bionic has iswctype_l() but not __iswctype_l
++GOM(__iswctype_l, iFEuLL)
++#else
+ GO(__iswctype_l, iFuLL)
++#endif
+ GOW(iswctype_l, iFuLp)
+ GOW(iswdigit, iFu)
+ //GO(__iswdigit_l, 
+@@ -1368,7 +1403,12 @@ GOW(mbsinit, iFp)
+ GO(mbsnrtowcs, LFppLLp)
+ GO(__mbsnrtowcs_chk, LFppLLpL)
+ GO(mbsrtowcs, LFppLp)
++#ifdef ANDROID
++// bionic has mbsrtowcs() but not __mbsrtowcs_chk
++GOM(__mbsrtowcs_chk, LFEppLpL)
++#else
+ GO(__mbsrtowcs_chk, LFppLpL)
++#endif
+ GO(mbstowcs, LFppL)
+ GO(__mbstowcs_chk, LFppLL)
+ GO(mbtowc, iFppL)
+@@ -1492,7 +1532,12 @@ GOW(nanosleep, iFpp)
+ GO(netname2host, iFppi)
+ GO(netname2user, iFppppp)
+ #endif
++#ifdef ANDROID
++// bionic has newlocale() but not __newlocale
++GOM(__newlocale, pFEipp)
++#else
+ GO(__newlocale, pFipp)
++#endif
+ GOW(newlocale, pFipp)
+ //GO(nfsservctl, 
+ GOM(nftw, iFEppii)
+@@ -1505,7 +1550,12 @@ GOM(nl_langinfo, pFi)
+ #else
+ GO(nl_langinfo, pFi)
+ #endif
++#ifdef ANDROID
++// bionic has nl_langinfo_l() but not __nl_langinfo_l
++GOM(__nl_langinfo_l, pFEip)
++#else
+ GO(__nl_langinfo_l, pFip)
++#endif
+ GOW(nl_langinfo_l, pFip)
+ DATAB(_nl_msg_cat_cntr, 4)
+ GO(nrand48, lFp)
+@@ -2088,7 +2138,12 @@ GO(strchr, pFpi)
+ GO(strchrnul, pFpi)
+ GO(strcmp, iFpp)
+ GO(strcoll, iFpp)
++#ifdef ANDROID
++// bionic has strcoll_l() but not __strcoll_l
++GOM(__strcoll_l, iFEppp)
++#else
+ GO(__strcoll_l, iFppp)
++#endif
+ GOW(strcoll_l, iFppp)
+ GO(strcpy, pFpp)
+ GO(__strcpy_chk, pFppL)
+@@ -2115,7 +2170,12 @@ GO(strfmon, lFpLpdddddd)        // should be V, but only double are allowed...
+ GOW(strfmon_l, lFpLppdddddd)    // should be V, but only double are allowed...
+ GO(strfromd, iFpLpd)
+ GO(strfromf, iFpLpf)
++#ifdef ANDROID
++// bionic has neither strfromf128 nor strfromf64
++GOM(strfromf128, iFEpLpD)
++#else
+ GOD(strfromf128, iFpLpD, strfromf64)
++#endif
+ GO(strfromf32, iFpLpf)
+ GO(strfromf32x, iFpLpd)
+ GO(strfromf64, iFpLpd)
+@@ -2123,7 +2183,12 @@ GOD(strfromf64x, iFpLpD, strfromf32x)
+ GOD(strfroml, iFpLpD, strfromd)
+ GO(strfry, pFp)
+ GO(strftime, LFpLpp)
++#ifdef ANDROID
++// bionic has strftime_l() but not __strftime_l
++GOM(__strftime_l, LFEpLppL)
++#else
+ GO(__strftime_l, LFpLppL)
++#endif
+ GOW(strftime_l, LFpLppp)
+ GO(strlen, LFp)
+ GO(__strlcpy_chk, LFppLL)
+@@ -2157,11 +2222,21 @@ GO(strspn, LFpp)
+ GO(strstr, pFpp)
+ GO(strtod, dFpp)
+ GO(__strtod_internal, dFppi)
++#ifdef ANDROID
++// bionic has strtod_l() but not __strtod_l
++GOM(__strtod_l, dFEppp)
++#else
+ GO(__strtod_l, dFppp)
++#endif
+ GOW(strtod_l, dFppp)
+ //GO(__strtod_nan, 
+ GO(strtof, fFpp)
++#ifdef ANDROID
++// bionic has neither strtof128 nor strtof64
++GOM(strtof128, DFEpp)
++#else
+ GOD(strtof128, DFpp, strtof64)
++#endif
+ //GO(__strtof128_internal, 
+ //GOW(strtof128_l, 
+ //GO(__strtof128_nan, 
+@@ -2174,7 +2249,12 @@ GOW(strtof64_l, dFppp)
+ GOWD(strtof64x, DFpp, strtof32x)
+ GOWD(strtof64x_l, DFppp, strtof32x_l)
+ GO(__strtof_internal, fFppi)
++#ifdef ANDROID
++// bionic has strtof_l() but not __strtof_l
++GOM(__strtof_l, fFEppp)
++#else
+ GO(__strtof_l, fFppp)
++#endif
+ GOW(strtof_l, fFppp)
+ //GO(__strtof_nan, 
+ GO(strtoimax, IFppi)
+@@ -2222,7 +2302,12 @@ GOM(strverscmp, iFEpp)
+ GOW(strverscmp, iFpp)
+ #endif
+ GO(strxfrm, LFppL)
++#ifdef ANDROID
++// bionic has strxfrm_l() but not __strxfrm_l
++GOM(__strxfrm_l, LFEppLL)
++#else
+ GO(__strxfrm_l, LFppLL)
++#endif
+ GO(strxfrm_l, LFppLp)
+ //GO(stty, 
+ #ifdef STATICBUILD
+@@ -2401,10 +2486,20 @@ GOW(towctrans, uFup)
+ //GO(__towctrans_l, 
+ GOW(towctrans_l, uFupp)
+ GOW(towlower, uFu)
++#ifdef ANDROID
++// bionic has towlower_l() but not __towlower_l
++GOM(__towlower_l, iFEip)
++#else
+ GO(__towlower_l, iFip)
++#endif
+ GOW(towlower_l, uFup)
+ GOW(towupper, uFu)
++#ifdef ANDROID
++// bionic has towupper_l() but not __towupper_l
++GOM(__towupper_l, iFEip)
++#else
+ GO(__towupper_l, iFip)
++#endif
+ GOW(towupper_l, uFup)
+ //GO(tr_break, 
+ GO(truncate, iFpl)
+@@ -2449,7 +2544,12 @@ GO(unshare, iFi)
+ GOW(updwtmp, vFpp)
+ GO(updwtmpx, vFpp)
+ //GO(uselib, 
++#ifdef ANDROID
++// bionic has uselocale() but not __uselocale
++GOM(__uselocale, pFEp)
++#else
+ GO(__uselocale, pFp)
++#endif
+ GOW(uselocale, pFp)
+ #ifdef STATICBUILD
+ //GO(user2netname, 
+@@ -2529,14 +2629,24 @@ GO(wcschr, pFpi)
+ GO(wcschrnul, pFpi)
+ GO(wcscmp, iFpp)
+ GOW(wcscoll, iFpp)
++#ifdef ANDROID
++// bionic has wcscoll_l() but not __wcscoll_l
++GOM(__wcscoll_l, iFEppp)
++#else
+ GO(__wcscoll_l, iFppp)
++#endif
+ GOW(wcscoll_l, iFppp)
+ GO(wcscpy, pFpp)
+ GO(__wcscpy_chk, pFppL)
+ GO(wcscspn, LFpp)
+ GO(wcsdup, pFp)
+ GO(wcsftime, LFpLpp)
++#ifdef ANDROID
++// bionic has wcsftime_l() but not __wcsftime_l
++GOM(__wcsftime_l, LFEpLppp)
++#else
+ GO(__wcsftime_l, LFpLppp)
++#endif
+ GO(wcsftime_l, LFpLppp)
+ GO(wcslen, LFp)
+ GO(wcsncasecmp, iFppL)
+@@ -2615,7 +2725,12 @@ GOW(wcstouq, UFppi)
+ GOW(wcswcs, pFpp)
+ GO(wcswidth, iFpL)
+ GO(wcsxfrm, LFppL)
++#ifdef ANDROID
++// bionic has wcsxfrm_l() but not __wcsxfrm_l
++GOM(__wcsxfrm_l, LFEppLL)
++#else
+ GO(__wcsxfrm_l, LFppLL)
++#endif
+ GO(wcsxfrm_l, LFppLp)
+ GO(wctob, iFu)
+ GO(wctomb, iFpi)
+@@ -2625,18 +2740,33 @@ GOW(wctrans, pFp)
+ GOW(wctrans_l, pFpp)
+ GOW(wctype, LFp)
+ GOW(wctype_l, LFpp)
++#ifdef ANDROID
++// bionic has wctype_l() but not __wctype_l
++GOM(__wctype_l, LFEpp)
++#else
+ GO(__wctype_l, LFpp)
++#endif
+ GO(wcwidth, iFi)
+ GO(wmemchr, pFpiL)
+ GO(wmemcmp, iFppL)
+ GOW(wmemcpy, pFppL)
++#ifdef ANDROID
++// bionic has wmemcpy() but not __wmemcpy_chk
++GOM(__wmemcpy_chk, pFEppLL)
++#else
+ GO(__wmemcpy_chk, pFppLL)
++#endif
+ GO(wmemmove, pFppL)
+ GO(__wmemmove_chk, pFppLL)
+ GOW(wmempcpy, pFppL)
+ //GO(__wmempcpy_chk, 
+ GO(wmemset, pFpiL)
++#ifdef ANDROID
++// bionic has wmemset() but not __wmemset_chk
++GOM(__wmemset_chk, pFEpuLL)
++#else
+ GO(__wmemset_chk, pFpuLL)
++#endif
+ GO(wordexp, iFppi)
+ GO(wordfree, vFp)
+ //GO(__woverflow, 
+@@ -3331,3 +3461,18 @@ GO(ynf, fFif)
+ // __ynf_finite
+ // __yn_finite
+ GOD(ynl, DFiD, yn)
++
++#ifdef ANDROID
++// bionic/libzstd provide no ZSTD_trace_* hooks (optional even in libzstd);
++// no-op stubs so guests that import them resolve instead of failing JUMP_SLOT.
++GOM(ZSTD_trace_decompress_begin, vFEp)
++GOM(ZSTD_trace_decompress_end, vFEp)
++GOM(ZSTD_trace_compress_begin, vFEp)
++GOM(ZSTD_trace_compress_end, vFEp)
++#else
++// not in glibc either; weak so an unresolved guest import decays to 0.
++GOW(ZSTD_trace_decompress_begin, vFp)
++GOW(ZSTD_trace_decompress_end, vFp)
++GOW(ZSTD_trace_compress_begin, vFp)
++GOW(ZSTD_trace_compress_end, vFp)
++#endif

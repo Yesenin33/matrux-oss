@@ -1,0 +1,73 @@
+diff --git a/src/elfs/elfloader.c b/src/elfs/elfloader.c
+index 255e06c2..551edc6f 100644
+--- a/src/elfs/elfloader.c
++++ b/src/elfs/elfloader.c
+@@ -760,6 +760,8 @@ static int RelocateElfRELA(lib_t *maplib, lib_t *local_maplib, int bindnow, int
+                     if (!offs) {
+                         if(strcmp(symname, "__gmon_start__") && strcmp(symname, "data_start") && strcmp(symname, "__data_start") && strcmp(symname, "collector_func_load"))
+                             printf_log((bind==STB_WEAK)?LOG_DEBUG:LOG_NONE, "%s: Global Symbol %s not found, cannot apply R_X86_64_GLOB_DAT @%p (%p) in %s\n", (bind==STB_WEAK)?"Warning":"Error", symname, p, *(void**)p, head->name);
++                        // undefined weak symbol -> 0 (glibc semantics); don't keep a stale value
++                        if(bind==STB_WEAK && p) *p = 0;
+                     } else {
+                         printf_dump(LOG_NEVER, "Apply %s R_X86_64_GLOB_DAT @%p (%p -> %p) on sym=%s (%sver=%d/%s, elf=%s)\n", BindSym(bind), p, (void*)(p?(*p):0), (void*)(offs + rela[i].r_addend), symname, veropt?"opt":"", version, vername?vername:"(none)", sym_elf?sym_elf->name:"(native)");
+                         *p = offs + rela[i].r_addend;
+@@ -781,6 +783,11 @@ static int RelocateElfRELA(lib_t *maplib, lib_t *local_maplib, int bindnow, int
+                     if (!offs) {
+                         if(bind==STB_WEAK) {
+                             printf_log(LOG_INFO, "Warning: Weak Symbol %s not found, cannot apply R_X86_64_JUMP_SLOT @%p (%p)\n", symname, p, *(void**)p);
++                            // glibc resolves an undefined weak symbol to address 0. box64 used to
++                            // leave the stale link-time PLT/resolver address in the slot, so a
++                            // guarded `if (fn) fn()` saw it as non-NULL and jumped into garbage
++                            // (or a dead resolver stub) -> hang. Zero it like glibc does.
++                            if(p) *p = 0;
+                         } else {
+                             printf_log(LOG_NONE, "Error: Symbol %s not found, cannot apply R_X86_64_JUMP_SLOT @%p (%p) in %s (%sver=%d / %s)\n", symname, p, *(void**)p, head->name, veropt?"opt":"", version, vername?vername:"(none)");
+                             ret_ok = 1;
+@@ -879,22 +886,35 @@ static int RelocateElfRELA(lib_t *maplib, lib_t *local_maplib, int bindnow, int
+                 }
+                 break;
+             case R_X86_64_TLSDESC:
+-                if(!symname || !symname[0]) {
+-                    printf_dump(LOG_NEVER, "Apply %s R_X86_64_TLSDESC @%p with addend=%zu\n", BindSym(bind), p, rela[i].r_addend);
+-                    struct tlsdesc volatile *td = (struct tlsdesc volatile *)p;
+-                    if(!tlsdescUndefweak)
+-                        tlsdescUndefweak = AddBridge(my_context->system, pFE, my__dl_tlsdesc_undefweak, 0, "_dl_tlsdesc_undefweak");
+-                    td->entry = tlsdescUndefweak;
+-                    td->arg = (uintptr_t)(head->tlsbase + rela[i].r_addend);
+-                } if(symname && sym_elf && elfsym) {
+-                    printf_dump(LOG_NEVER, "Apply %s R_X86_64_TLSDESC @%p for %s with addend=%zu\n", BindSym(bind), p, symname, rela[i].r_addend);
++                // A TLS descriptor is the 2-word pair {resolver, arg}. Under box64 the resolver is
++                // always bridged to my__dl_tlsdesc_undefweak, which simply returns td->arg (the
++                // TP-relative offset of the variable) in RAX. We must ALWAYS write a complete
++                // descriptor: the original code used a broken `if {} if {} else {}` chain, so a
++                // named-but-unresolved symbol fell into the else and left the GOT descriptor
++                // half-initialised, making the guest call a garbage resolver (hang inside a futex).
++                {
+                     struct tlsdesc volatile *td = (struct tlsdesc volatile *)p;
+                     if(!tlsdescUndefweak)
+                         tlsdescUndefweak = AddBridge(my_context->system, pFE, my__dl_tlsdesc_undefweak, 0, "_dl_tlsdesc_undefweak");
+                     td->entry = tlsdescUndefweak;
+-                    td->arg = (uintptr_t)(sym_elf->tlsbase + offs + rela[i].r_addend);
+-                } else {
+-                    printf_log(LOG_INFO, "Warning, R_X86_64_TLSDESC used with Symbol %s(%p) not supported for now \n", symname, sym);
++                    if(!symname || !symname[0]) {
++                        // local (STN_UNDEF) descriptor: r_addend is the offset inside this module's TLS block
++                        printf_dump(LOG_NEVER, "Apply %s R_X86_64_TLSDESC @%p with addend=%zu\n", BindSym(bind), p, rela[i].r_addend);
++                        td->arg = (uintptr_t)(head->tlsbase + rela[i].r_addend);
++                    } else if(sym_elf && elfsym) {
++                        printf_dump(LOG_NEVER, "Apply %s R_X86_64_TLSDESC @%p for %s with addend=%zu\n", BindSym(bind), p, symname, rela[i].r_addend);
++                        td->arg = (uintptr_t)(sym_elf->tlsbase + offs + rela[i].r_addend);
++                    } else {
++                        // Symbol not resolved. glibc resolves an undefined weak TLS symbol to a
++                        // NULL address; do the same so callers guard on it instead of using
++                        // whatever was in the GOT (which used to hang here). Diagnostic only.
++                        if(bind==STB_WEAK) {
++                            printf_log(LOG_DEBUG, "Warning: Weak Symbol %s not found, R_X86_64_TLSDESC @%p resolved to NULL\n", symname, p);
++                        } else {
++                            printf_log(LOG_INFO, "Warning, R_X86_64_TLSDESC used with unresolved Symbol %s(%p) @%p, resolved to NULL\n", symname, sym, p);
++                        }
++                        td->arg = 0;
++                    }
+                 }
+                 break;
+             default:

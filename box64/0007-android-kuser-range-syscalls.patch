@@ -1,0 +1,36 @@
+--- a/src/tools/wine_tools.c
++++ b/src/tools/wine_tools.c
+@@ -78,7 +78,7 @@
+ void preserve_highest32();
+ 
+ #define KUSER_SHARED_DATA ((uintptr_t)0x7ffe0000)
+-#define KUSER_SHARED_SIZE ((size_t)0x1000)
++#define KUSER_SHARED_SIZE ((size_t)0x4000)
+ 
+ static int kuser_ready = 0;
+ 
+@@ -214,7 +214,9 @@
+     setProtection_mmap(KUSER_SHARED_DATA, KUSER_SHARED_SIZE, PROT_READ | PROT_WRITE);
+     /* Same bit Wine writes into KUSER_SHARED_DATA.SystemCall. Harmless if a
+      * later MAP_FIXED shared section replaces the page. */
+-    ((volatile uint8_t *)KUSER_SHARED_DATA)[0x308] = 1;
++    /* SystemCall=0: ntdll идёт обычным путём `syscall`, а не через диспетчер
++     * по 0x7ffe1000 — его указатель ставит только прелоадер, которого нет. */
++    ((volatile uint8_t *)KUSER_SHARED_DATA)[0x308] = 0;
+     kuser_ready = 1;
+     printf_log(LOG_INFO, "KUSER branch: startup RW page at 0x7ffe0000 before guest runs\n");
+ }
+--- a/src/emu/x64syscall.c
++++ b/src/emu/x64syscall.c
+@@ -270,6 +270,11 @@
+     [161] = {__NR_chroot, 1},
+     [165] = {__NR_mount, 5},
+     [186] = {__NR_gettid, 0 },    //0xBA
++#ifdef __NR_getxattr
++    [191] = {__NR_getxattr, 4},
++    [192] = {__NR_lgetxattr, 4},
++    [193] = {__NR_fgetxattr, 4},
++#endif
+     [194] = {__NR_listxattr, 3},
+     [195] = {__NR_llistxattr, 3},
+     [196] = {__NR_flistxattr, 3},

@@ -1,0 +1,45 @@
+diff --git a/src/wrapped/wrappedlibc.c b/src/wrapped/wrappedlibc.c
+--- a/src/wrapped/wrappedlibc.c
++++ b/src/wrapped/wrappedlibc.c
+@@ -3847,6 +3847,22 @@
+     } else {
+         ret = box_mmap(addr, length, prot, flags, fd, offset);
+         e = errno;
++#ifdef ANDROID
++        // targetSdk >= 29: SELinux rejects PROT_EXEC on a file mapping in the
++        // app directory (EACCES). Dynarec executes from its own anonymous
++        // cache and only consults the guest table, so keep EXEC there and
++        // map the file without it. Anonymous PROT_EXEC (JIT, dynarec) is left
++        // untouched: that mmap is allowed and must stay executable on the host.
++        if(ret==MAP_FAILED && (prot&PROT_EXEC) && fd>=0 && !(flags&MAP_ANONYMOUS)
++           && (e==EACCES || e==EPERM)) {
++            int host = prot & ~PROT_EXEC;
++            if(!host) host = PROT_READ;
++            ret = box_mmap(addr, length, host, flags, fd, offset);
++            e = errno;
++            if(ret!=MAP_FAILED)
++                printf_log(LOG_INFO, "Android: file mmap(%p, 0x%zx, 0x%x) kept EXEC in guest table, host prot 0x%x\n", addr, length, prot, host);
++        }
++#endif
+     }
+     if(emu && box64_is32bits && ret!=MAP_FAILED && ((ret>(void*)0xc0000000) || (ret+length>(void*)0xc0000000))) {
+         // do not allow allocating memory that high for 32bits process
+@@ -4071,6 +4087,18 @@
+     uintptr_t start = (uintptr_t)addr;
+     if(box64_pagesize == X86_PAGE_SIZE) {
+         int ret = mprotect(addr, len, prot);
++#ifdef ANDROID
++        // Same restriction as mmap above. Retry without EXEC for the host, but
++        // still publish the guest prot (with EXEC) so CheckExec / FillBlock64
++        // accept the page. Returning EACCES would make Wine keep the page RW.
++        if(ret && (prot&PROT_EXEC) && (errno==EACCES || errno==EPERM)) {
++            int host = prot & ~PROT_EXEC;
++            if(!host) host = PROT_READ;
++            ret = mprotect(addr, len, host);
++            if(!ret)
++                printf_log(LOG_INFO, "Android: mprotect(%p, 0x%lx, 0x%x) kept EXEC in guest table, host prot 0x%x\n", addr, len, prot, host);
++        }
++#endif
+         if(!ret && len) {
+             updateProtection(start, len, prot);
+             setGuestProtection(start, len, prot, 0);

@@ -1,0 +1,171 @@
+diff --git a/src/libtools/android_dlopen.c b/src/libtools/android_dlopen.c
+new file mode 100644
+index 00000000..11111111
+--- /dev/null
++++ b/src/libtools/android_dlopen.c
+@@ -0,0 +1,165 @@
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <unistd.h>
++#include <limits.h>
++#include <sys/stat.h>
++#include <dlfcn.h>
++
++#include "libdl.h"
++#include "box64context.h"
++#include "debug.h"
++#include "elfloader.h"
++
++#ifdef ANDROID
++/* android_update_LD_LIBRARY_PATH lives in the linker. Weak so a stub NDK still links. */
++extern void android_update_LD_LIBRARY_PATH(const char* path) __attribute__((weak));
++
++static void* bionic_dlopen(const char* path, int flags)
++{
++    static void* (*real_dlopen_fn)(const char*, int) = NULL;
++    if(!real_dlopen_fn)
++        real_dlopen_fn = (void* (*)(const char*, int))GetNativeSymbolUnversioned(RTLD_DEFAULT, "dlopen");
++    if(!real_dlopen_fn)
++        real_dlopen_fn = (void* (*)(const char*, int))GetNativeSymbolUnversioned(RTLD_NEXT, "dlopen");
++    if(!real_dlopen_fn)
++        return NULL;
++    return real_dlopen_fn(path, flags);
++}
++
++static int exe_dir(char* out, size_t n)
++{
++    char exe[PATH_MAX];
++    ssize_t len = readlink("/proc/self/exe", exe, sizeof(exe) - 1);
++    if(len <= 0)
++        return 0;
++    exe[len] = 0;
++    char* slash = strrchr(exe, '/');
++    if(!slash || slash == exe)
++        return 0;
++    *slash = 0;
++    if(strlen(exe) + 1 > n)
++        return 0;
++    memcpy(out, exe, strlen(exe) + 1);
++    return 1;
++}
++
++/* libfoo.so.N[.M] -> libfoo.so. Anything else is copied unchanged. */
++static void unversioned_so(const char* name, char* out, size_t n)
++{
++    const char* dot = strstr(name, ".so.");
++    if(!dot) {
++        snprintf(out, n, "%s", name);
++        return;
++    }
++    for(const char* p = dot + 4; *p; ++p) {
++        if(*p != '.' && (*p < '0' || *p > '9')) {
++            snprintf(out, n, "%s", name);
++            return;
++        }
++    }
++    size_t len = (size_t)(dot - name) + 3;
++    if(len + 1 > n) {
++        out[0] = 0;
++        return;
++    }
++    memcpy(out, name, len);
++    out[len] = 0;
++}
++
++static int is_reg(const char* path)
++{
++    struct stat st;
++    return path && stat(path, &st) == 0 && S_ISREG(st.st_mode);
++}
++
++static void* try_dir(const char* dir, const char** names, int nnames, int flags, const char* wanted)
++{
++    char path[PATH_MAX];
++    if(!dir || !*dir)
++        return NULL;
++    for(int i = 0; i < nnames; ++i) {
++        if(!names[i] || !names[i][0])
++            continue;
++        int k = snprintf(path, sizeof(path), "%s/%s", dir, names[i]);
++        if(k <= 0 || (size_t)k >= sizeof(path) || !is_reg(path))
++            continue;
++        void* h = bionic_dlopen(path, flags);
++        if(h) {
++            printf_log(LOG_INFO, "Android: dlopen(%s) -> %s\n", wanted, path);
++            return h;
++        }
++    }
++    return NULL;
++}
++
++EXPORT void* box64_android_dlopen(const char* filename, int flags)
++{
++    void* h = bionic_dlopen(filename, flags);
++    if(h || !filename || strchr(filename, '/'))
++        return h;
++
++    char stripped[PATH_MAX];
++    unversioned_so(filename, stripped, sizeof(stripped));
++    const char* names[4];
++    int nnames = 0;
++    names[nnames++] = filename;
++    if(stripped[0] && strcmp(stripped, filename))
++        names[nnames++] = stripped;
++    if(!strcmp(filename, "libvulkan.so.1"))
++        names[nnames++] = "libvulkan_matrux.so";
++
++    char dir[PATH_MAX];
++    if(exe_dir(dir, sizeof(dir))) {
++        h = try_dir(dir, names, nnames, flags, filename);
++        if(h)
++            return h;
++    }
++
++    const char* lp = getenv("LD_LIBRARY_PATH");
++    if(lp && *lp) {
++        char* dup = box_strdup(lp);
++        if(dup) {
++            char* save = NULL;
++            for(char* tok = strtok_r(dup, ":", &save); tok; tok = strtok_r(NULL, ":", &save)) {
++                h = try_dir(tok, names, nnames, flags, filename);
++                if(h) {
++                    box_free(dup);
++                    return h;
++                }
++            }
++            box_free(dup);
++        }
++    }
++
++    printf_log(LOG_INFO, "Android: dlopen(%s) not found (%s)\n", filename, dlerror() ? dlerror() : "no such file");
++    return NULL;
++}
++
++EXPORT void box64_android_fix_library_path(void)
++{
++    char dir[PATH_MAX];
++    if(!exe_dir(dir, sizeof(dir))) {
++        printf_log(LOG_INFO, "Android: /proc/self/exe has no directory, linker path unchanged\n");
++        return;
++    }
++    const char* lp = getenv("LD_LIBRARY_PATH");
++    char buf[8192];
++    int k = (lp && *lp) ? snprintf(buf, sizeof(buf), "%s:%s", dir, lp)
++                        : snprintf(buf, sizeof(buf), "%s", dir);
++    if(k <= 0 || (size_t)k >= sizeof(buf))
++        snprintf(buf, sizeof(buf), "%s", dir);
++    setenv("LD_LIBRARY_PATH", buf, 1);
++
++    void (*update)(const char*) = android_update_LD_LIBRARY_PATH;
++    if(!update)
++        update = (void (*)(const char*))GetNativeSymbolUnversioned(RTLD_DEFAULT, "android_update_LD_LIBRARY_PATH");
++    if(update) {
++        update(buf);
++        printf_log(LOG_INFO, "Android: linker path %s\n", buf);
++    } else {
++        printf_log(LOG_INFO, "Android: android_update_LD_LIBRARY_PATH missing, LD_LIBRARY_PATH=%s\n", buf);
++    }
++}
++
++#endif

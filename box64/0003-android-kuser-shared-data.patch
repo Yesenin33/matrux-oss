@@ -1,0 +1,325 @@
+diff --git a/src/core.c b/src/core.c
+index 74e3a67..fb5f4ff 100644
+--- a/src/core.c
++++ b/src/core.c
+@@ -1531,10 +1531,10 @@ int initialize(int argc, const char **argv, char** env, x64emu_t** emulator, elf
+         if(!ElfGetGlobalSymbolStartEnd(elf_header, &wineinfo, NULL, "wine_main_preload_info", &ver, &vername, 1, &veropt))
+             if(!ElfGetWeakSymbolStartEnd(elf_header, &wineinfo, NULL, "wine_main_preload_info", &ver, &vername, 1, &veropt))
+                 ElfGetLocalSymbolStartEnd(elf_header, &wineinfo, NULL, "wine_main_preload_info", &ver, &vername, 1, &veropt);
+-        if(!wineinfo) {printf_log(LOG_DEBUG, "Warning, Symbol wine_main_preload_info not found\n");}
++        if(!wineinfo) {printf_log(LOG_INFO, "Warning, Symbol wine_main_preload_info not found\n");}
+         else {
+             *(void**)wineinfo = get_wine_prereserve();
+-            printf_log(LOG_DEBUG, "WINE wine_main_preload_info found and updated %p -> %p\n", get_wine_prereserve(), *(void**)wineinfo);
++            printf_log(LOG_INFO, "WINE wine_main_preload_info found and updated %p -> %p\n", get_wine_prereserve(), *(void**)wineinfo);
+         }
+         #ifdef DYNAREC
+         dynarec_wine_prereserve();
+diff --git a/src/include/wine_tools.h b/src/include/wine_tools.h
+index bd0e73e..fe44dbe 100644
+--- a/src/include/wine_tools.h
++++ b/src/include/wine_tools.h
+@@ -2,10 +2,17 @@
+ #ifndef __WINE_TOOLS_H__
+ #define __WINE_TOOLS_H__
+ 
++#include <stddef.h>
++#include <stdint.h>
++
+ void wine_prereserve(const char* reserve);
+ 
+ extern int wine_preloaded;
+ void* get_wine_prereserve(void);
++/* 1 if [addr, addr+size) sits entirely inside a block this process already
++ * mapped for Wine (PROT_NONE prereserve). Guest MAP_FIXED_NOREPLACE there
++ * must be retried as MAP_FIXED: that mapping is ours, not a conflict. */
++int wine_prereserve_owns(uintptr_t addr, size_t size);
+ 
+ #ifdef DYNAREC
+ void dynarec_wine_prereserve(void);
+diff --git a/src/tools/wine_tools.c b/src/tools/wine_tools.c
+index e59afb0..e3bd3a4 100644
+--- a/src/tools/wine_tools.c
++++ b/src/tools/wine_tools.c
+@@ -5,6 +5,8 @@
+ #include <stdint.h>
+ #include <sys/mman.h>
+ #include <errno.h>
++#include <signal.h>
++#include <unistd.h>
+ 
+ #include "wine_tools.h"
+ #include "debug.h"
+@@ -75,6 +77,220 @@ static void remove_prereserve(int idx)
+ }
+ 
+ void preserve_highest32();
++
++#define KUSER_SHARED_DATA ((uintptr_t)0x7ffe0000)
++#define KUSER_SHARED_SIZE ((size_t)0x1000)
++
++int wine_prereserve_owns(uintptr_t addr, size_t size)
++{
++    if(!size || addr + size < addr) return 0;
++    uintptr_t end = addr + size;
++    for(int i = 0; my_wine_reserve[i].addr && my_wine_reserve[i].size; ++i) {
++        uintptr_t base = (uintptr_t)my_wine_reserve[i].addr;
++        uintptr_t bend = base + my_wine_reserve[i].size;
++        if(addr >= base && end <= bend) return 1;
++    }
++    return 0;
++}
++
++#ifdef ANDROID
++extern char **environ;
++
++/* Log the VMA covering KUSER_SHARED_DATA. Returns 1 and fills *lo/*hi if mapped. */
++static int kuser_occupant(uintptr_t *lo, uintptr_t *hi, int *is_stack)
++{
++    FILE *f = fopen("/proc/self/maps", "r");
++    if(!f) {
++        printf_log(LOG_INFO, "KUSER 0x7ffe0000: cannot read /proc/self/maps (%s)\n", strerror(errno));
++        return 0;
++    }
++    char line[512];
++    int found = 0;
++    while(fgets(line, sizeof(line), f)) {
++        uintptr_t s, e;
++        if(sscanf(line, "%lx-%lx", &s, &e) != 2) continue;
++        if(KUSER_SHARED_DATA < s || KUSER_SHARED_DATA >= e) continue;
++        char *nl = strchr(line, '\n');
++        if(nl) *nl = 0;
++        printf_log(LOG_INFO, "KUSER 0x7ffe0000 occupied before prereserve: %s\n", line);
++        if(lo) *lo = s;
++        if(hi) *hi = e;
++        if(is_stack) *is_stack = strstr(line, "[stack]") != NULL;
++        found = 1;
++        break;
++    }
++    fclose(f);
++    if(!found)
++        printf_log(LOG_INFO, "KUSER 0x7ffe0000 is unmapped before prereserve\n");
++    return found;
++}
++
++static void relocate_stack_words(uintptr_t *p, size_t nwords, uintptr_t lo, uintptr_t hi, ptrdiff_t delta)
++{
++    for(size_t i = 0; i < nwords; ++i) {
++        uintptr_t v = p[i];
++        if(v >= lo && v < hi && !(v & 7))
++            p[i] = (uintptr_t)(v + delta);
++    }
++}
++
++static void retarget_environ(uintptr_t lo, uintptr_t hi, ptrdiff_t delta)
++{
++    if(!environ) return;
++    uintptr_t e = (uintptr_t)environ;
++    char **arr = environ;
++    if(e >= lo && e < hi)
++        arr = (char **)(e + delta);
++    for(char **p = arr; p && *p; ++p) {
++        uintptr_t v = (uintptr_t)*p;
++        if(v >= lo && v < hi)
++            *p = (char *)(v + delta);
++    }
++    if(e >= lo && e < hi)
++        environ = arr;
++}
++
++/* Copy the live stack off a VMA that covers 0x7ffe0000 and munmap the old one.
++ * Only the main thread exists here (wine_prereserve runs before any guest thread).
++ * Callee-saved regs are in this frame; relocate_stack_words rewrites them so the
++ * epilogue hands the caller adjusted pointers. */
++static int android_pivot_stack(uintptr_t old_lo, uintptr_t old_hi, void *new_lo) __attribute__((noinline));
++static int android_pivot_stack(uintptr_t old_lo, uintptr_t old_hi, void *new_lo)
++{
++    uintptr_t sp, fp;
++    asm volatile("mov %0, sp\n\tmov %1, x29" : "=r"(sp), "=r"(fp));
++    if(sp < old_lo || sp >= old_hi || ((old_hi - sp) & 15)) {
++        printf_log(LOG_INFO, "KUSER: refuse stack pivot, sp=%p not inside %p-%p\n",
++            (void *)sp, (void *)old_lo, (void *)old_hi);
++        return 0;
++    }
++    ptrdiff_t delta = (uintptr_t)new_lo - old_lo;
++    uintptr_t new_sp = sp + delta;
++    uintptr_t new_fp = (fp >= old_lo && fp < old_hi) ? fp + delta : fp;
++    asm volatile(
++        "mov x2, %[src]\n"
++        "mov x3, %[dst]\n"
++        "mov x4, %[end]\n"
++        "1:\n"
++        "cmp x2, x4\n"
++        "b.hs 2f\n"
++        "ldp x5, x6, [x2], #16\n"
++        "stp x5, x6, [x3], #16\n"
++        "b 1b\n"
++        "2:\n"
++        :
++        : [src]"r"(sp), [dst]"r"(new_sp), [end]"r"(old_hi)
++        : "x2", "x3", "x4", "x5", "x6", "cc", "memory");
++    relocate_stack_words((uintptr_t *)new_sp, (old_hi - sp) / sizeof(uintptr_t), old_lo, old_hi, delta);
++    retarget_environ(old_lo, old_hi, delta);
++    /* Clobber x19-x28 so the prologue saved the caller's copies into the frame
++     * we just rewrote. munmap is syscall 215 and does not touch the stack. */
++    asm volatile(
++        "mov sp, %[nsp]\n"
++        "mov x29, %[nfp]\n"
++        "mov x0, %[lo]\n"
++        "mov x1, %[len]\n"
++        "mov x8, #215\n"
++        "svc #0\n"
++        :
++        : [nsp]"r"(new_sp), [nfp]"r"(new_fp), [lo]"r"(old_lo), [len]"r"(old_hi - old_lo)
++        : "x0", "x1", "x8", "x19", "x20", "x21", "x22", "x23", "x24", "x25", "x26", "x27", "x28", "cc", "memory");
++    return 1;
++}
++
++static int range_hits_prereserve(uintptr_t s, uintptr_t e)
++{
++    static const uintptr_t zones[][2] = {
++        {0x00010000, 0x00020000},
++        {0x00110000, 0x30110000},
++        {0x7f000000, 0x82000000},
++    };
++    for(int i = 0; i < 3; ++i)
++        if(s < zones[i][1] && e > zones[i][0]) return 1;
++    return 0;
++}
++
++static void android_move_stack_off_kuser(void)
++{
++    uintptr_t lo = 0, hi = 0;
++    int is_stack = 0;
++    if(!kuser_occupant(&lo, &hi, &is_stack)) return;
++    if(!is_stack) {
++        printf_log(LOG_INFO, "KUSER 0x7ffe0000 is not [stack]; will not munmap it\n");
++        return;
++    }
++    size_t len = hi - lo;
++    if(len > (64u * 1024u * 1024u)) {
++        printf_log(LOG_INFO, "KUSER: [stack] is 0x%zx bytes, not moving it\n", len);
++        return;
++    }
++    void *hints[] = {(void *)0x400000000ULL, NULL};
++    void *neu = MAP_FAILED;
++    for(int i = 0; i < 2 && neu == MAP_FAILED; ++i) {
++        void *p = mmap(hints[i], len, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
++        if(p == MAP_FAILED) continue;
++        uintptr_t ps = (uintptr_t)p, pe = ps + len;
++        if((ps < hi && pe > lo) || range_hits_prereserve(ps, pe)) {
++            munmap(p, len);
++            continue;
++        }
++        neu = p;
++    }
++    if(neu == MAP_FAILED) {
++        printf_log(LOG_INFO, "KUSER: failed to allocate a replacement stack (%s)\n", strerror(errno));
++        return;
++    }
++    printf_log(LOG_INFO, "KUSER: moving [stack] %p-%p off 0x7ffe0000 to %p\n",
++        (void *)lo, (void *)hi, neu);
++    sigset_t set, old;
++    sigfillset(&set);
++    sigprocmask(SIG_BLOCK, &set, &old);
++    int moved = android_pivot_stack(lo, hi, neu);
++    sigprocmask(SIG_SETMASK, &old, NULL);
++    if(!moved) {
++        munmap(neu, len);
++        printf_log(LOG_INFO, "KUSER: stack pivot did not run; 0x7ffe0000 stays inside [stack]\n");
++        return;
++    }
++    freeProtection(lo, len);
++    box64_mapclean = 0;
++    loadProtectionFromMap();
++    printf_log(LOG_INFO, "KUSER: stack moved, 0x7ffe0000 %s\n",
++        isBlockFree((void *)KUSER_SHARED_DATA, KUSER_SHARED_SIZE) ? "is free" : "still occupied");
++}
++
++/* If the 48MB block was dropped, still pin the single KUSER page when it is free. */
++static void android_ensure_kuser_page(void)
++{
++    if(wine_prereserve_owns(KUSER_SHARED_DATA, KUSER_SHARED_SIZE)) {
++        printf_log(LOG_INFO, "KUSER 0x7ffe0000 is inside a Wine prereserve\n");
++        return;
++    }
++    if(!isBlockFree((void *)KUSER_SHARED_DATA, KUSER_SHARED_SIZE)) {
++        printf_log(LOG_INFO, "KUSER 0x7ffe0000 still not free; Wine MAP_FIXED_NOREPLACE will fail\n");
++        return;
++    }
++    int idx = 0;
++    while(my_wine_reserve[idx].size) ++idx;
++    if(idx >= (int)(sizeof(my_wine_reserve) / sizeof(my_wine_reserve[0])) - 1) {
++        printf_log(LOG_INFO, "KUSER: prereserve table full, cannot add 0x7ffe0000\n");
++        return;
++    }
++    void *ret = mmap((void *)KUSER_SHARED_DATA, KUSER_SHARED_SIZE, 0,
++        MAP_FIXED | MAP_PRIVATE | MAP_ANON | MAP_NORESERVE, -1, 0);
++    if(ret != (void *)KUSER_SHARED_DATA) {
++        printf_log(LOG_INFO, "KUSER: mmap(0x7ffe0000) failed: %s\n", strerror(errno));
++        if(ret && ret != MAP_FAILED) munmap(ret, KUSER_SHARED_SIZE);
++        return;
++    }
++    my_wine_reserve[idx].addr = (void *)KUSER_SHARED_DATA;
++    my_wine_reserve[idx].size = KUSER_SHARED_SIZE;
++    setProtection_mmap(KUSER_SHARED_DATA, KUSER_SHARED_SIZE, 0);
++    printf_log(LOG_INFO, "WINE prereserve of %p:0x%lx done\n",
++        my_wine_reserve[idx].addr, my_wine_reserve[idx].size);
++}
++#endif
++
+ void wine_prereserve(const char* reserve)
+ {
+     init_custommem_helper(my_context);
+@@ -85,6 +301,10 @@ void wine_prereserve(const char* reserve)
+         add_no_overlap(addr, size);
+     }
+ 
++#ifdef ANDROID
++    android_move_stack_off_kuser();
++#endif
++
+     int idx = 0;
+     while(my_wine_reserve[idx].addr && my_wine_reserve[idx].size) {
+         void* ret = NULL;
+@@ -103,6 +323,10 @@ void wine_prereserve(const char* reserve)
+         }
+     }
+ 
++#ifdef ANDROID
++    android_ensure_kuser_page();
++#endif
++
+     preserve_highest32();
+ 
+     wine_preloaded = 1;
+diff --git a/src/wrapped/wrappedlibc.c b/src/wrapped/wrappedlibc.c
+index 59ae243..66a967a 100644
+--- a/src/wrapped/wrappedlibc.c
++++ b/src/wrapped/wrappedlibc.c
+@@ -4138,6 +4138,25 @@ EXPORT void* my_mmap64(x64emu_t* emu, void *addr, size_t length, int prot, int f
+             if(ret!=MAP_FAILED)
+                 printf_log(LOG_INFO, "Android: file mmap(%p, 0x%zx, 0x%x) kept EXEC in guest table, host prot 0x%x\n", addr, length, prot, host);
+         }
++        /* Wine maps KUSER_SHARED_DATA at 0x7ffe0000 with MAP_FIXED_NOREPLACE.
++         * On a 39-bit Android VA the page is usually free, and wine_prereserve
++         * has already MAP_FIXED it (0x7f000000+0x3000000). Without a working
++         * wine_main_preload_info (--without-preloader, or dlsym misses it)
++         * ntdll does not treat that mapping as a reserved area, so NOREPLACE
++         * returns EEXIST and NtAllocateVirtualMemory fails with c0000018.
++         * The bytes are our PROT_NONE prereserve: replace them. EINVAL covers
++         * kernels that reject MAP_FIXED_NOREPLACE (Linux < 4.17, some 4.14
++         * Android trees) when the range is still ours. */
++        if(ret==MAP_FAILED && addr && length && box64_wine
++           && (flags & MAP_FIXED_NOREPLACE) && !(flags & MAP_FIXED)
++           && (e==EEXIST || e==EINVAL)
++           && wine_prereserve_owns((uintptr_t)addr, length)) {
++            int fixed = (flags | MAP_FIXED) & ~MAP_FIXED_NOREPLACE;
++            ret = box_mmap(addr, length, prot, fixed, fd, offset);
++            e = errno;
++            if(ret!=MAP_FAILED)
++                printf_log(LOG_INFO, "Android: mmap(%p, 0x%zx) MAP_FIXED_NOREPLACE -> MAP_FIXED inside Wine prereserve\n", addr, length);
++        }
+ #endif
+     }
+     if(emu && box64_is32bits && ret!=MAP_FAILED && ((ret>(void*)0xc0000000) || (ret+length>(void*)0xc0000000))) {

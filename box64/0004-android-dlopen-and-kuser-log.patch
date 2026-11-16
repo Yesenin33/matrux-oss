@@ -1,0 +1,455 @@
+diff --git a/src/core.c b/src/core.c
+index fb5f4ff..cd10f07 100644
+--- a/src/core.c
++++ b/src/core.c
+@@ -48,6 +48,7 @@
+ #include "x64emu.h"
+ #include "library.h"
+ #include "core.h"
++#include "libdl.h"
+ #include "env.h"
+ #include "dynacache.h"
+ #include "cleanup.h"
+@@ -857,6 +858,10 @@ int initialize(int argc, const char **argv, char** env, x64emu_t** emulator, elf
+         box64_pagesize = 4096;
+ 
+     LoadEnvVariables();
++#ifdef ANDROID
++    /* Before any wrapped dlopen: bionic otherwise will not search nativeLibraryDir. */
++    box64_android_fix_library_path();
++#endif
+     InitializeEnvFiles();
+ 
+     const char* prog = argv[1];
+diff --git a/src/include/libdl.h b/src/include/libdl.h
+index 10e7366..050a79e 100644
+--- a/src/include/libdl.h
++++ b/src/include/libdl.h
+@@ -14,4 +14,11 @@ typedef struct my_hookedlib_s {
+     void* priv;
+ } my_hookedlib_t;
+ 
++#ifdef ANDROID
++/* bionic dlopen plus absolute-path fallback for versioned SONAMEs. */
++void* box64_android_dlopen(const char* filename, int flags);
++/* dirname(/proc/self/exe) + LD_LIBRARY_PATH into the bionic linker namespace. */
++void box64_android_fix_library_path(void);
++#endif
++
+ #endif //__LIBDL_H__
+\ No newline at end of file
+diff --git a/src/libtools/libdl.c b/src/libtools/libdl.c
+index 7daf381..14f6895 100644
+--- a/src/libtools/libdl.c
++++ b/src/libtools/libdl.c
+@@ -10,6 +10,10 @@
+ #include <unistd.h>
+ #include <stddef.h>
+ #include <dlfcn.h>
++#ifdef ANDROID
++#include <limits.h>
++#include <sys/stat.h>
++#endif
+ 
+ #include "libdl.h"
+ #include "box64context.h"
+@@ -131,4 +135,153 @@ EXPORT void* dlsym(void* handle, const char* symbol)
+ 
+     return real_dlsym(handle, symbol);
+ }
+-EXPORT void* ___dlsym(void *handle, const char* symbol)  __attribute__((alias("dlsym")));
+\ No newline at end of file
++EXPORT void* ___dlsym(void *handle, const char* symbol)  __attribute__((alias("dlsym")));
++
++#ifdef ANDROID
++/* android_update_LD_LIBRARY_PATH lives in the linker. Weak so a stub NDK still links. */
++extern void android_update_LD_LIBRARY_PATH(const char* path) __attribute__((weak));
++
++static void* bionic_dlopen(const char* path, int flags)
++{
++    if(!real_dlopen)
++        real_dlopen = GetNativeSymbolUnversioned(RTLD_NEXT, "dlopen");
++    if(!real_dlopen)
++        return NULL;
++    return real_dlopen(path, flags);
++}
++
++static int exe_dir(char* out, size_t n)
++{
++    char exe[PATH_MAX];
++    ssize_t len = readlink("/proc/self/exe", exe, sizeof(exe) - 1);
++    if(len <= 0)
++        return 0;
++    exe[len] = 0;
++    char* slash = strrchr(exe, '/');
++    if(!slash || slash == exe)
++        return 0;
++    *slash = 0;
++    if(strlen(exe) + 1 > n)
++        return 0;
++    memcpy(out, exe, strlen(exe) + 1);
++    return 1;
++}
++
++/* libfoo.so.N[.M] -> libfoo.so. Anything else is copied unchanged. */
++static void unversioned_so(const char* name, char* out, size_t n)
++{
++    const char* dot = strstr(name, ".so.");
++    if(!dot) {
++        snprintf(out, n, "%s", name);
++        return;
++    }
++    for(const char* p = dot + 4; *p; ++p) {
++        if(*p != '.' && (*p < '0' || *p > '9')) {
++            snprintf(out, n, "%s", name);
++            return;
++        }
++    }
++    size_t len = (size_t)(dot - name) + 3;
++    if(len + 1 > n) {
++        out[0] = 0;
++        return;
++    }
++    memcpy(out, name, len);
++    out[len] = 0;
++}
++
++static int is_reg(const char* path)
++{
++    struct stat st;
++    return path && stat(path, &st) == 0 && S_ISREG(st.st_mode);
++}
++
++static void* try_dir(const char* dir, const char** names, int nnames, int flags, const char* wanted)
++{
++    char path[PATH_MAX];
++    if(!dir || !*dir)
++        return NULL;
++    for(int i = 0; i < nnames; ++i) {
++        if(!names[i] || !names[i][0])
++            continue;
++        int k = snprintf(path, sizeof(path), "%s/%s", dir, names[i]);
++        if(k <= 0 || (size_t)k >= sizeof(path) || !is_reg(path))
++            continue;
++        void* h = bionic_dlopen(path, flags);
++        if(h) {
++            printf_log(LOG_INFO, "Android: dlopen(%s) -> %s\n", wanted, path);
++            return h;
++        }
++    }
++    return NULL;
++}
++
++EXPORT void* box64_android_dlopen(const char* filename, int flags)
++{
++    void* h = bionic_dlopen(filename, flags);
++    if(h || !filename || strchr(filename, '/'))
++        return h;
++
++    char stripped[PATH_MAX];
++    unversioned_so(filename, stripped, sizeof(stripped));
++    const char* names[4];
++    int nnames = 0;
++    names[nnames++] = filename;
++    if(stripped[0] && strcmp(stripped, filename))
++        names[nnames++] = stripped;
++    if(!strcmp(filename, "libvulkan.so.1"))
++        names[nnames++] = "libvulkan_matrux.so";
++
++    char dir[PATH_MAX];
++    if(exe_dir(dir, sizeof(dir))) {
++        h = try_dir(dir, names, nnames, flags, filename);
++        if(h)
++            return h;
++    }
++
++    const char* lp = getenv("LD_LIBRARY_PATH");
++    if(lp && *lp) {
++        char* dup = box_strdup(lp);
++        if(dup) {
++            char* save = NULL;
++            for(char* tok = strtok_r(dup, ":", &save); tok; tok = strtok_r(NULL, ":", &save)) {
++                h = try_dir(tok, names, nnames, flags, filename);
++                if(h) {
++                    box_free(dup);
++                    return h;
++                }
++            }
++            box_free(dup);
++        }
++    }
++
++    printf_log(LOG_INFO, "Android: dlopen(%s) not found (%s)\n", filename, dlerror() ? dlerror() : "no such file");
++    return NULL;
++}
++
++EXPORT void box64_android_fix_library_path(void)
++{
++    char dir[PATH_MAX];
++    if(!exe_dir(dir, sizeof(dir))) {
++        printf_log(LOG_INFO, "Android: /proc/self/exe has no directory, linker path unchanged\n");
++        return;
++    }
++    const char* lp = getenv("LD_LIBRARY_PATH");
++    char buf[8192];
++    int k = (lp && *lp) ? snprintf(buf, sizeof(buf), "%s:%s", dir, lp)
++                        : snprintf(buf, sizeof(buf), "%s", dir);
++    if(k <= 0 || (size_t)k >= sizeof(buf))
++        snprintf(buf, sizeof(buf), "%s", dir);
++    setenv("LD_LIBRARY_PATH", buf, 1);
++
++    void (*update)(const char*) = android_update_LD_LIBRARY_PATH;
++    if(!update)
++        update = (void (*)(const char*))GetNativeSymbolUnversioned(RTLD_DEFAULT, "android_update_LD_LIBRARY_PATH");
++    if(update) {
++        update(buf);
++        printf_log(LOG_INFO, "Android: linker path %s\n", buf);
++    } else {
++        printf_log(LOG_INFO, "Android: android_update_LD_LIBRARY_PATH missing, LD_LIBRARY_PATH=%s\n", buf);
++    }
++}
++#endif
+\ No newline at end of file
+diff --git a/src/tools/wine_tools.c b/src/tools/wine_tools.c
+index e3bd3a4..36710ed 100644
+--- a/src/tools/wine_tools.c
++++ b/src/tools/wine_tools.c
+@@ -5,8 +5,7 @@
+ #include <stdint.h>
+ #include <sys/mman.h>
+ #include <errno.h>
+-#include <signal.h>
+-#include <unistd.h>
++#include <pthread.h>
+ 
+ #include "wine_tools.h"
+ #include "debug.h"
+@@ -94,8 +93,6 @@ int wine_prereserve_owns(uintptr_t addr, size_t size)
+ }
+ 
+ #ifdef ANDROID
+-extern char **environ;
+-
+ /* Log the VMA covering KUSER_SHARED_DATA. Returns 1 and fills *lo/*hi if mapped. */
+ static int kuser_occupant(uintptr_t *lo, uintptr_t *hi, int *is_stack)
+ {
+@@ -125,149 +122,50 @@ static int kuser_occupant(uintptr_t *lo, uintptr_t *hi, int *is_stack)
+     return found;
+ }
+ 
+-static void relocate_stack_words(uintptr_t *p, size_t nwords, uintptr_t lo, uintptr_t hi, ptrdiff_t delta)
+-{
+-    for(size_t i = 0; i < nwords; ++i) {
+-        uintptr_t v = p[i];
+-        if(v >= lo && v < hi && !(v & 7))
+-            p[i] = (uintptr_t)(v + delta);
+-    }
+-}
+-
+-static void retarget_environ(uintptr_t lo, uintptr_t hi, ptrdiff_t delta)
+-{
+-    if(!environ) return;
+-    uintptr_t e = (uintptr_t)environ;
+-    char **arr = environ;
+-    if(e >= lo && e < hi)
+-        arr = (char **)(e + delta);
+-    for(char **p = arr; p && *p; ++p) {
+-        uintptr_t v = (uintptr_t)*p;
+-        if(v >= lo && v < hi)
+-            *p = (char *)(v + delta);
+-    }
+-    if(e >= lo && e < hi)
+-        environ = arr;
+-}
+-
+-/* Copy the live stack off a VMA that covers 0x7ffe0000 and munmap the old one.
+- * Only the main thread exists here (wine_prereserve runs before any guest thread).
+- * Callee-saved regs are in this frame; relocate_stack_words rewrites them so the
+- * epilogue hands the caller adjusted pointers. */
+-static int android_pivot_stack(uintptr_t old_lo, uintptr_t old_hi, void *new_lo) __attribute__((noinline));
+-static int android_pivot_stack(uintptr_t old_lo, uintptr_t old_hi, void *new_lo)
+-{
+-    uintptr_t sp, fp;
+-    asm volatile("mov %0, sp\n\tmov %1, x29" : "=r"(sp), "=r"(fp));
+-    if(sp < old_lo || sp >= old_hi || ((old_hi - sp) & 15)) {
+-        printf_log(LOG_INFO, "KUSER: refuse stack pivot, sp=%p not inside %p-%p\n",
+-            (void *)sp, (void *)old_lo, (void *)old_hi);
+-        return 0;
+-    }
+-    ptrdiff_t delta = (uintptr_t)new_lo - old_lo;
+-    uintptr_t new_sp = sp + delta;
+-    uintptr_t new_fp = (fp >= old_lo && fp < old_hi) ? fp + delta : fp;
+-    asm volatile(
+-        "mov x2, %[src]\n"
+-        "mov x3, %[dst]\n"
+-        "mov x4, %[end]\n"
+-        "1:\n"
+-        "cmp x2, x4\n"
+-        "b.hs 2f\n"
+-        "ldp x5, x6, [x2], #16\n"
+-        "stp x5, x6, [x3], #16\n"
+-        "b 1b\n"
+-        "2:\n"
+-        :
+-        : [src]"r"(sp), [dst]"r"(new_sp), [end]"r"(old_hi)
+-        : "x2", "x3", "x4", "x5", "x6", "cc", "memory");
+-    relocate_stack_words((uintptr_t *)new_sp, (old_hi - sp) / sizeof(uintptr_t), old_lo, old_hi, delta);
+-    retarget_environ(old_lo, old_hi, delta);
+-    /* Clobber x19-x28 so the prologue saved the caller's copies into the frame
+-     * we just rewrote. munmap is syscall 215 and does not touch the stack. */
+-    asm volatile(
+-        "mov sp, %[nsp]\n"
+-        "mov x29, %[nfp]\n"
+-        "mov x0, %[lo]\n"
+-        "mov x1, %[len]\n"
+-        "mov x8, #215\n"
+-        "svc #0\n"
+-        :
+-        : [nsp]"r"(new_sp), [nfp]"r"(new_fp), [lo]"r"(old_lo), [len]"r"(old_hi - old_lo)
+-        : "x0", "x1", "x8", "x19", "x20", "x21", "x22", "x23", "x24", "x25", "x26", "x27", "x28", "cc", "memory");
+-    return 1;
+-}
+-
+-static int range_hits_prereserve(uintptr_t s, uintptr_t e)
+-{
+-    static const uintptr_t zones[][2] = {
+-        {0x00010000, 0x00020000},
+-        {0x00110000, 0x30110000},
+-        {0x7f000000, 0x82000000},
+-    };
+-    for(int i = 0; i < 3; ++i)
+-        if(s < zones[i][1] && e > zones[i][0]) return 1;
+-    return 0;
+-}
+-
+-static void android_move_stack_off_kuser(void)
++static void android_log_kuser_branch(void)
+ {
+     uintptr_t lo = 0, hi = 0;
+     int is_stack = 0;
+-    if(!kuser_occupant(&lo, &hi, &is_stack)) return;
+-    if(!is_stack) {
+-        printf_log(LOG_INFO, "KUSER 0x7ffe0000 is not [stack]; will not munmap it\n");
+-        return;
+-    }
+-    size_t len = hi - lo;
+-    if(len > (64u * 1024u * 1024u)) {
+-        printf_log(LOG_INFO, "KUSER: [stack] is 0x%zx bytes, not moving it\n", len);
++    if(!kuser_occupant(&lo, &hi, &is_stack)) {
++        printf_log(LOG_INFO, "KUSER branch: 0x7ffe0000 is free; Wine prereserve will own it and MAP_FIXED_NOREPLACE inside that range is retried as MAP_FIXED\n");
+         return;
+     }
+-    void *hints[] = {(void *)0x400000000ULL, NULL};
+-    void *neu = MAP_FAILED;
+-    for(int i = 0; i < 2 && neu == MAP_FAILED; ++i) {
+-        void *p = mmap(hints[i], len, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+-        if(p == MAP_FAILED) continue;
+-        uintptr_t ps = (uintptr_t)p, pe = ps + len;
+-        if((ps < hi && pe > lo) || range_hits_prereserve(ps, pe)) {
+-            munmap(p, len);
+-            continue;
++    if(is_stack) {
++        int main_thread = 0;
++        int queried = 0;
++        pthread_attr_t attr;
++        void *base = NULL;
++        size_t size = 0;
++        if(!pthread_getattr_np(pthread_self(), &attr)) {
++            queried = 1;
++            pthread_attr_getstack(&attr, &base, &size);
++            pthread_attr_destroy(&attr);
++            uintptr_t b = (uintptr_t)base;
++            if(size && KUSER_SHARED_DATA >= b && KUSER_SHARED_DATA < b + size)
++                main_thread = 1;
+         }
+-        neu = p;
+-    }
+-    if(neu == MAP_FAILED) {
+-        printf_log(LOG_INFO, "KUSER: failed to allocate a replacement stack (%s)\n", strerror(errno));
+-        return;
+-    }
+-    printf_log(LOG_INFO, "KUSER: moving [stack] %p-%p off 0x7ffe0000 to %p\n",
+-        (void *)lo, (void *)hi, neu);
+-    sigset_t set, old;
+-    sigfillset(&set);
+-    sigprocmask(SIG_BLOCK, &set, &old);
+-    int moved = android_pivot_stack(lo, hi, neu);
+-    sigprocmask(SIG_SETMASK, &old, NULL);
+-    if(!moved) {
+-        munmap(neu, len);
+-        printf_log(LOG_INFO, "KUSER: stack pivot did not run; 0x7ffe0000 stays inside [stack]\n");
++        /* The main-thread stack is the kernel VMA. Moving it and munmap'ing it
++         * drops argv/env and the frame we are executing on. Never do that. */
++        printf_log(LOG_INFO, "KUSER branch: [stack] %p-%p %s\n",
++            (void *)lo, (void *)hi,
++            !queried ? "pthread_getattr_np failed, not moved" :
++            main_thread ? "is the current thread stack, not moved" :
++                          "is not the current thread stack, not moved");
+         return;
+     }
+-    freeProtection(lo, len);
+-    box64_mapclean = 0;
+-    loadProtectionFromMap();
+-    printf_log(LOG_INFO, "KUSER: stack moved, 0x7ffe0000 %s\n",
+-        isBlockFree((void *)KUSER_SHARED_DATA, KUSER_SHARED_SIZE) ? "is free" : "still occupied");
++    printf_log(LOG_INFO, "KUSER branch: 0x7ffe0000 is occupied by a non-stack mapping (%p-%p); left in place\n",
++        (void *)lo, (void *)hi);
+ }
+ 
+ /* If the 48MB block was dropped, still pin the single KUSER page when it is free. */
+ static void android_ensure_kuser_page(void)
+ {
+     if(wine_prereserve_owns(KUSER_SHARED_DATA, KUSER_SHARED_SIZE)) {
+-        printf_log(LOG_INFO, "KUSER 0x7ffe0000 is inside a Wine prereserve\n");
++        printf_log(LOG_INFO, "KUSER branch: page is inside the Wine prereserve; MAP_FIXED_NOREPLACE there is retried as MAP_FIXED\n");
+         return;
+     }
+     if(!isBlockFree((void *)KUSER_SHARED_DATA, KUSER_SHARED_SIZE)) {
+-        printf_log(LOG_INFO, "KUSER 0x7ffe0000 still not free; Wine MAP_FIXED_NOREPLACE will fail\n");
++        printf_log(LOG_INFO, "KUSER branch: page still occupied after prereserve; MAP_FIXED_NOREPLACE will return c0000018\n");
+         return;
+     }
+     int idx = 0;
+@@ -302,7 +200,7 @@ void wine_prereserve(const char* reserve)
+     }
+ 
+ #ifdef ANDROID
+-    android_move_stack_off_kuser();
++    android_log_kuser_branch();
+ #endif
+ 
+     int idx = 0;
+diff --git a/src/wrapped/wrappedlib_init.h b/src/wrapped/wrappedlib_init.h
+index b07d4d2..170ea17 100644
+--- a/src/wrapped/wrappedlib_init.h
++++ b/src/wrapped/wrappedlib_init.h
+@@ -5,6 +5,12 @@
+ 
+ #include "debug.h"
+ #include "librarian/library_inner.h"
++#ifdef ANDROID
++#include "libdl.h"
++#define BOX64_DLOPEN(name, flags) box64_android_dlopen((name), (flags))
++#else
++#define BOX64_DLOPEN(name, flags) dlopen((name), (flags))
++#endif
+ 
+ #define FUNC3(M,N) wrapped##M##N
+ #define FUNC2(M,N) FUNC3(M,N)
+@@ -175,13 +181,13 @@ int FUNC(_init)(library_t* lib, box64context_t* box64)
+ #endif
+     {
+ #ifndef STATICBUILD
+-        lib->w.lib = dlopen(MAPNAME(Name), RTLD_LAZY | RTLD_GLOBAL);
++        lib->w.lib = BOX64_DLOPEN(MAPNAME(Name), RTLD_LAZY | RTLD_GLOBAL);
+         if(!lib->w.lib) {
+ #ifdef ALTNAME
+-            lib->w.lib = dlopen(ALTNAME, RTLD_LAZY | RTLD_GLOBAL);
++            lib->w.lib = BOX64_DLOPEN(ALTNAME, RTLD_LAZY | RTLD_GLOBAL);
+             if(!lib->w.lib) {
+ #ifdef ALTNAME2
+-                lib->w.lib = dlopen(ALTNAME2, RTLD_LAZY | RTLD_GLOBAL);
++                lib->w.lib = BOX64_DLOPEN(ALTNAME2, RTLD_LAZY | RTLD_GLOBAL);
+                 if(!lib->w.lib)
+ #endif
+ #endif

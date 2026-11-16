@@ -1,0 +1,67 @@
+diff --git a/src/wrapped/wrappedlibc.c b/src/wrapped/wrappedlibc.c
+index df773255..88465b72 100644
+--- a/src/wrapped/wrappedlibc.c
++++ b/src/wrapped/wrappedlibc.c
+@@ -3975,6 +3975,32 @@ EXPORT int my___uflow(x64emu_t* emu, FILE* f)
+ }
+ #endif
+ 
++#ifdef ANDROID
++// bionic lacks eaccess()/euidaccess() entirely (it only has access()/faccessat()).
++// glibc's eaccess/euidaccess check access against the *effective* uid/gid, which is
++// faccessat(AT_FDCWD, path, mode, AT_EACCESS). bionic's <fcntl.h> does not define
++// AT_EACCESS, and the underlying kernel faccessat2 syscall (and bionic's wrapper)
++// may not be available, so fall back to access() on EINVAL. euid==uid under
++// Wine/box64, so the fallback is semantically equivalent.
++#ifndef AT_EACCESS
++#define AT_EACCESS 0x200
++#endif
++EXPORT int my_eaccess(x64emu_t* emu, const char* path, int mode)
++{
++    (void)emu;
++    int ret = faccessat(AT_FDCWD, path, mode, AT_EACCESS);
++    if(ret == -1 && errno == EINVAL)
++        ret = access(path, mode);
++    return ret;
++}
++
++// glibc keeps euidaccess as the non-deprecated spelling of the same check.
++EXPORT int my_euidaccess(x64emu_t* emu, const char* path, int mode)
++{
++    return my_eaccess(emu, path, mode);
++}
++#endif
++
+ EXPORT void* my_realpath(x64emu_t* emu, void* path, void* resolved_path)
+ {
+     if(path && isProcSelf(path, "exe")) {
+diff --git a/src/wrapped/wrappedlibc_private.h b/src/wrapped/wrappedlibc_private.h
+index a72ee4e8..3140992c 100644
+--- a/src/wrapped/wrappedlibc_private.h
++++ b/src/wrapped/wrappedlibc_private.h
+@@ -298,7 +298,12 @@ GOW(dup3, iFiiO)
+ GO(__duplocale, pFp)
+ GOW(duplocale, pFp)
+ GO(dysize, iFi)
++#ifdef ANDROID
++// bionic has neither eaccess nor euidaccess; provide my_ wrappers (see wrappedlibc.c)
++GOM(eaccess, iFEpi)
++#else
+ GOW(eaccess, iFpi)
++#endif
+ #ifdef STATICBUILD
+ //GO(ecb_crypt, 
+ #else
+@@ -381,7 +386,12 @@ GO(ether_ntoa, pFp)
+ GO(ether_ntoa_r, pFpp)
+ GO(ether_ntohost, iFpp)
+ #endif
++#ifdef ANDROID
++// bionic has neither eaccess nor euidaccess; provide my_ wrappers (see wrappedlibc.c)
++GOM(euidaccess, iFEpi)
++#else
+ GOW(euidaccess, iFpi)
++#endif
+ GO(eventfd, iFui)
+ GO(eventfd_read, iFip)
+ GO(eventfd_write, iFiU)

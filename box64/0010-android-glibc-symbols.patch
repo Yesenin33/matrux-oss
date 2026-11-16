@@ -1,0 +1,155 @@
+diff --git a/src/wrapped/wrappedlibc.c b/src/wrapped/wrappedlibc.c
+index 14026a3a..df773255 100644
+--- a/src/wrapped/wrappedlibc.c
++++ b/src/wrapped/wrappedlibc.c
+@@ -3889,11 +3889,91 @@ EXPORT int32_t my_setjmp(x64emu_t* emu, /*struct __jmp_buf_tag __env[1]*/void *p
+     return  my___sigsetjmp(emu, p, 1);
+ }
+ 
+-EXPORT void my___explicit_bzero_chk(x64emu_t* emu, void* dst, uint32_t len, uint32_t dstlen)
++#ifdef ANDROID
++// bionic lacks explicit_bzero/__explicit_bzero_chk; implement the glibc semantics
++EXPORT void my_explicit_bzero(x64emu_t* emu, void* dst, size_t len)
++{
++    (void)emu;
++    memset(dst, 0, len);
++}
++
++EXPORT void my___explicit_bzero_chk(x64emu_t* emu, void* dst, size_t len, size_t dstlen)
+ {
+     (void)emu; (void)dstlen;
+     memset(dst, 0, len);
+ }
++#endif
++
++#ifdef ANDROID
++// bionic has no strverscmp; use the glibc algorithm (string/strverscmp.c)
++#define VS_S_N    0x0
++#define VS_S_I    0x3
++#define VS_S_F    0x6
++#define VS_S_Z    0x9
++#define VS_CMP    2
++#define VS_LEN    3
++EXPORT int my_strverscmp(x64emu_t* emu, const char* s1, const char* s2)
++{
++    (void)emu;
++    const unsigned char* p1 = (const unsigned char*)s1;
++    const unsigned char* p2 = (const unsigned char*)s2;
++    static const uint8_t next_state[] = {
++        /* state    x    d    0  */
++        /* S_N */  VS_S_N, VS_S_I, VS_S_Z,
++        /* S_I */  VS_S_N, VS_S_I, VS_S_I,
++        /* S_F */  VS_S_N, VS_S_F, VS_S_F,
++        /* S_Z */  VS_S_N, VS_S_F, VS_S_Z
++    };
++    static const int8_t result_type[] = {
++        /* state   x/x  x/d  x/0  d/x  d/d  d/0  0/x  0/d  0/0  */
++        /* S_N */  VS_CMP, VS_CMP, VS_CMP, VS_CMP, VS_LEN, VS_CMP, VS_CMP, VS_CMP, VS_CMP,
++        /* S_I */  VS_CMP, -1,     -1,     +1,     VS_LEN, VS_LEN, +1,     VS_LEN, VS_LEN,
++        /* S_F */  VS_CMP, VS_CMP, VS_CMP, VS_CMP, VS_CMP, VS_CMP, VS_CMP, VS_CMP, VS_CMP,
++        /* S_Z */  VS_CMP, +1,     +1,     -1,     VS_CMP, VS_CMP, -1,     VS_CMP, VS_CMP
++    };
++    if (p1 == p2)
++        return 0;
++    unsigned char c1 = *p1++;
++    unsigned char c2 = *p2++;
++    /* Hint: '0' is a digit too.  */
++    int state = VS_S_N + ((c1 == '0') + (isdigit(c1) != 0));
++    int diff;
++    while ((diff = c1 - c2) == 0) {
++        if (c1 == '\0')
++            return diff;
++        state = next_state[state];
++        c1 = *p1++;
++        c2 = *p2++;
++        state += (c1 == '0') + (isdigit(c1) != 0);
++    }
++    state = result_type[state * 3 + (((c2 == '0') + (isdigit(c2) != 0)))];
++    switch (state) {
++        case VS_CMP:
++            return diff;
++        case VS_LEN:
++            while (isdigit (*p1++))
++                if (!isdigit (*p2++))
++                    return 1;
++            return isdigit (*p2) ? -1 : diff;
++        default:
++            return state;
++    }
++}
++#undef VS_S_N
++#undef VS_S_I
++#undef VS_S_F
++#undef VS_S_Z
++#undef VS_CMP
++#undef VS_LEN
++
++// bionic has no __uflow; it is the stdio "underflow" that reads the next byte,
++// i.e. functionally getc() on the host FILE*.
++EXPORT int my___uflow(x64emu_t* emu, FILE* f)
++{
++    (void)emu;
++    return getc(f);
++}
++#endif
+ 
+ EXPORT void* my_realpath(x64emu_t* emu, void* path, void* resolved_path)
+ {
+diff --git a/src/wrapped/wrappedlibc_private.h b/src/wrapped/wrappedlibc_private.h
+index acd3f9ef..a72ee4e8 100644
+--- a/src/wrapped/wrappedlibc_private.h
++++ b/src/wrapped/wrappedlibc_private.h
+@@ -395,8 +395,14 @@ GOWM(execvpe, iFEppp)
+ GOM(_exit, vFEi)
+ GOM(exit, vFEi)
+ GOW(_Exit, vFi)
++#ifdef ANDROID
++// bionic (Android libc) has neither explicit_bzero nor __explicit_bzero_chk
++GOM(explicit_bzero, vFEpL)
++GOM(__explicit_bzero_chk, vFEpLL)
++#else
+ GO(explicit_bzero, vFpL)
+ GO(__explicit_bzero_chk, vFpLL)
++#endif
+ GO(faccessat, iFipii)
+ GOW(fallocate, iFiill)
+ GO(fallocate64, iFiiII)
+@@ -616,7 +622,12 @@ GO(__getcwd_chk, pFpLL)
+ GO(getdate, pFp)
+ //DATAB(getdate_err, 4)
+ GOW(getdate_r, iFpp)
++#ifdef ANDROID
++// bionic lacks __getdelim but exports getdelim with the same semantics
++GO2(__getdelim, lFppiS, getdelim)
++#else
+ GOW(__getdelim, lFppiS)
++#endif
+ GO(getdelim, lFppiS)
+ GO(getdents64, lFipL)
+ GO(getdirentries, lFipLp)
+@@ -2194,7 +2205,12 @@ GO(strtoumax, UFppi)
+ GO2(__isoc23_strtoumax, UFppi, strtoumax)
+ GOW(strtouq, UFppi)
+ //GO(__strverscmp, 
++#ifdef ANDROID
++// bionic has no strverscmp; provide the glibc algorithm
++GOM(strverscmp, iFEpp)
++#else
+ GOW(strverscmp, iFpp)
++#endif
+ GO(strxfrm, LFppL)
+ GO(__strxfrm_l, LFppLL)
+ GO(strxfrm_l, LFppLp)
+@@ -2396,7 +2412,12 @@ DATA(__tzname, 16)
+ DATAV(tzname, 16)
+ GOW(tzset, vFv)
+ GO(ualarm, uFuu)
++#ifdef ANDROID
++// bionic has no __uflow; __uflow(FILE*) reads the next byte (like getc)
++GOM(__uflow, iFES)
++#else
+ GO(__uflow, iFS)
++#endif
+ GOW(ulckpwdf, iFv)
+ #ifdef STATICBUILD
+ //GOW(ulimit, lFiV)
