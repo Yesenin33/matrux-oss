@@ -9,7 +9,7 @@
 | `alpine-xfce` | Alpine Linux | 427 | `packages-alpine-xfce.csv` |
 | `debian-xfce` | Debian GNU/Linux | 490 | `packages-debian-xfce.csv` |
 | `ubuntu-xfce` | Ubuntu | 710 | `packages-ubuntu-xfce.csv` |
-| `arch-xfce` | Arch Linux | перечень в образе (`/usr/share/licenses`, `/var/lib/pacman/local`) | — |
+| `arch-xfce` | Arch Linux | база pacman в образе отсутствует, перечень не поставляется | лицензии — `/usr/share/licenses` |
 | `dev-xfce` | Debian/Ubuntu + инструменты разработчика | 927 | `packages-dev-xfce.csv` |
 
 Перечни лежат в [`licenses/`](licenses/) — имя пакета, версия и (где дистрибутив её хранит) лицензия.
